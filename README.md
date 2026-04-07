@@ -36,6 +36,7 @@ FlexStackBenchmarking/
 | B2 | Full-stack RX throughput | Off + On | Laptop, RPi3, RPi5 | CPython, PyPy, Rust |
 | B3 | Concurrent TX/RX throughput | Off + On | Laptop, RPi3, RPi5 | CPython, PyPy, Rust |
 | B4 | ASN.1 Codec (encode + decode) | N/A | Laptop, RPi3, RPi5 | CPython, PyPy, Rust |
+| B5 | Security Layer (sign + verify) | N/A | Laptop, RPi3, RPi5 | CPython, PyPy, Rust |
 
 Each cell: **30 independent runs × 60s measurement** with warm-up discard (5s CPython/Rust, 15s PyPy).
 
@@ -117,7 +118,15 @@ Measures CAM generation rate through the complete stack: CA Service → BTP → 
 
 ### `--mode rx` (B2: Full-Stack RX Throughput)
 
-A dedicated TX stack sends encoded CAMs via BTP at maximum rate on loopback, while a separate RX stack receives and decodes them with a direct BTP callback. Measures per-packet RX decode latency and throughput.
+Receive-only mode: listens on the network interface for incoming CAMs sent by a remote sender (e.g. another machine running `--mode tx`). No internal TX stack is spawned. Measures per-packet RX decode latency and throughput.
+
+Cross-machine example:
+```bash
+# Machine A (sender)
+sudo ./flexstack-bench --mode tx --interface eth0 --duration 70
+# Machine B (receiver)
+sudo ./flexstack-bench --mode rx --interface eth0 --duration 60
+```
 
 ### `--mode concurrent` (B3: Concurrent TX/RX)
 
@@ -127,6 +136,10 @@ Simultaneous TX and RX. TX generates CAMs at maximum rate while RX decodes incom
 
 In-memory UPER encode/decode of CAM messages. No networking involved. Measures pure ASN.1 processing throughput.
 
+### `--mode security-sign` / `--mode security-verify` (B5: Security Layer)
+
+In-memory ECDSA-P256 signing or verification of a CAM-sized payload. No networking involved. Measures pure cryptographic throughput of the security layer.
+
 ## CLI Interface
 
 Both Python and Rust benchmarks share the same CLI:
@@ -135,7 +148,7 @@ Both Python and Rust benchmarks share the same CLI:
 flexstack-bench / benchmark.py [OPTIONS]
 
 OPTIONS:
-  --mode <tx|rx|concurrent|codec-encode|codec-decode>  Benchmark mode
+  --mode <tx|rx|concurrent|codec-encode|codec-decode|security-sign|security-verify>  Benchmark mode
   --security <off|on>                                  ECDSA-P256 security
   --duration <seconds>                                 Measurement time [60]
   --warmup <seconds>                                   Warm-up discard [5]

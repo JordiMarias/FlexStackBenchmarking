@@ -570,31 +570,14 @@ def bench_concurrent(args):
 # ── Benchmark: RX Throughput ────────────────────────────────────────────────
 def bench_rx(args):
     """
-    Full-stack RX throughput.
-    A TX stack sends encoded CAMs directly via BTP at max rate on loopback,
-    while a separate minimal RX stack (LinkLayer → GN → BTP) receives and
-    decodes them. Measures per-packet RX decode latency and throughput.
+    Full-stack RX throughput (receive-only).
+    Listens on the network interface for incoming CAMs sent by a remote sender
+    (e.g. another machine running `--mode tx`). No internal TX stack is spawned.
+    Measures per-packet RX decode latency and throughput.
     """
     from flexstack.facilities.ca_basic_service.cam_coder import CAMCoder
-    from flexstack.geonet.service_access_point import (
-        PacketTransportType, HeaderType, TopoBroadcastHST,
-        CommunicationProfile, TrafficClass, CommonNH,
-    )
-    from flexstack.btp.service_access_point import BTPDataRequest, BTPDataIndication
-    from flexstack.security.security_profiles import SecurityProfile
 
     security_on = args.security == "on"
-
-    # ── TX stack (full build_stack) ──────────────────────────────────────
-    (
-        tx_ca_svc,
-        tx_link_layer,
-        tx_loc_svc,
-        tx_gn_router,
-        tx_btp_router,
-        tx_station_id,
-        _,
-    ) = build_stack(security_on=security_on, interface=args.interface)
 
     # ── RX stack (minimal: LinkLayer → GN → BTP with direct callback) ──
     rx_mac = generate_random_mac()
@@ -624,7 +607,7 @@ def bench_rx(args):
     rx_lock = threading.Lock()
     coder_rx = CAMCoder()
 
-    def rx_btp_callback(indication: BTPDataIndication):
+    def rx_btp_callback(indication):
         t0 = time.monotonic_ns()
         try:
             coder_rx.decode(indication.data)
@@ -645,99 +628,22 @@ def bench_rx(args):
     )
     rx_gn_router.link_layer = rx_link_layer
 
-    # Encode a CAM for TX
-    cam_value = {
-        "header": {"protocolVersion": 2, "messageId": 2, "stationId": tx_station_id},
-        "cam": {
-            "generationDeltaTime": 1000,
-            "camParameters": {
-                "basicContainer": {
-                    "stationType": 5,
-                    "referencePosition": {
-                        "latitude": 415520000, "longitude": 21340000,
-                        "positionConfidenceEllipse": {
-                            "semiMajorAxisLength": 4095,
-                            "semiMinorAxisLength": 4095,
-                            "semiMajorAxisOrientation": 3601,
-                        },
-                        "altitude": {"altitudeValue": 12000, "altitudeConfidence": "unavailable"},
-                    },
-                },
-                "highFrequencyContainer": (
-                    "basicVehicleContainerHighFrequency",
-                    {
-                        "heading": {"headingValue": 900, "headingConfidence": 127},
-                        "speed": {"speedValue": 0, "speedConfidence": 127},
-                        "driveDirection": "unavailable",
-                        "vehicleLength": {"vehicleLengthValue": 1023, "vehicleLengthConfidenceIndication": "unavailable"},
-                        "vehicleWidth": 62,
-                        "longitudinalAcceleration": {"value": 161, "confidence": 102},
-                        "curvature": {"curvatureValue": 1023, "curvatureConfidence": "unavailable"},
-                        "curvatureCalculationMode": "unavailable",
-                        "yawRate": {"yawRateValue": 32767, "yawRateConfidence": "unavailable"},
-                    },
-                ),
-            },
-        },
-    }
-    encoded_cam = coder_rx.encode(cam_value)
-
-    def make_btp_request(data):
-        return BTPDataRequest(
-            btp_type=CommonNH.BTP_B,
-            source_port=0,
-            destination_port=2001,
-            destination_port_info=0,
-            gn_packet_transport_type=PacketTransportType(
-                header_type=HeaderType.TSB,
-                header_subtype=TopoBroadcastHST.SINGLE_HOP,
-            ),
-            communication_profile=CommunicationProfile.UNSPECIFIED,
-            traffic_class=TrafficClass(scf=False, channel_offload=False, tc_id=0),
-            security_profile=(
-                SecurityProfile.COOPERATIVE_AWARENESS_MESSAGE
-                if security_on
-                else SecurityProfile.NO_SECURITY
-            ),
-            its_aid=36,
-            security_permissions=b"",
-            gn_max_hop_limit=1,
-            length=len(data),
-            data=data,
-        )
-
-    # Warm-up
-    print(f"  Warm-up phase ({args.warmup}s)...")
+    # Warm-up: receive and discard
+    print(f"  Warm-up phase ({args.warmup}s) — waiting for packets from remote sender...")
     warmup_end = time.monotonic_ns() + args.warmup * 10**9
     while time.monotonic_ns() < warmup_end:
-        tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
-        time.sleep(0)
+        time.sleep(0.1)
 
+    warmup_count = rx_counter["count"]
+    print(f"  Warm-up received {warmup_count} packets")
     rx_counter["count"] = 0
     rx_counter["latencies"] = []
-
-    # TX background thread
-    stop_tx = threading.Event()
-
-    def tx_worker():
-        i = 0
-        while not stop_tx.is_set():
-            tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
-            i += 1
-            if i % 50 == 0:
-                time.sleep(0)
-
-    tx_thread = threading.Thread(target=tx_worker, daemon=True)
-    tx_thread.start()
 
     # Measurement
     print(f"  Measurement phase ({args.duration}s)...")
     t_start = time.monotonic_ns()
     time.sleep(args.duration)
     t_end = time.monotonic_ns()
-
-    stop_tx.set()
-    tx_thread.join(timeout=3)
 
     elapsed = (t_end - t_start) / 1e9
     rx_total = rx_counter["count"]
@@ -747,7 +653,6 @@ def bench_rx(args):
 
     latencies = rx_counter["latencies"]
 
-    teardown_stack(tx_ca_svc, tx_link_layer, tx_loc_svc)
     try:
         rx_link_layer.sock.close()
     except Exception:
@@ -873,6 +778,107 @@ def _bench_codec_with_flexstack_coder(args, coder):
     return compute_stats(args, args.mode, count, elapsed, throughput, latencies, [])
 
 
+# ── Benchmark: Security Layer (Sign / Verify) ──────────────────────────────
+def bench_security(args):
+    """
+    B5: Security layer throughput (sign or verify, in-memory).
+    Measures ECDSA-P256 signing or verification of a CAM-sized payload
+    without any networking. Uses the same SignService / VerifyService
+    that the full-stack benchmarks use.
+    """
+    from flexstack.facilities.ca_basic_service.cam_coder import CAMCoder
+    from flexstack.security.sn_sap import SNSIGNRequest, SNVERIFYRequest
+
+    is_sign = args.mode == "security-sign"
+    coder = CAMCoder()
+
+    # Build a realistic CAM payload to sign
+    cam_value = _make_cam_value(12345)
+    tbs_message = coder.encode(cam_value)
+    print(f"  CAM payload size: {len(tbs_message)} bytes")
+
+    sign_service, verify_service = setup_security(at_index=1)
+
+    # Pre-sign one message to get a signed envelope for the verify benchmark
+    sign_req = SNSIGNRequest(
+        tbs_message_length=len(tbs_message),
+        tbs_message=tbs_message,
+        its_aid=36,
+        permissions_length=0,
+        permissions=b"",
+    )
+    signed_confirm = sign_service.sign_cam(sign_req)
+    signed_message = signed_confirm.sec_message
+    print(f"  Signed message size: {len(signed_message)} bytes")
+
+    # Warm-up
+    print(f"  Warm-up phase ({args.warmup}s)...")
+    t_warmup_end = time.monotonic_ns() + args.warmup * 10**9
+    if is_sign:
+        while time.monotonic_ns() < t_warmup_end:
+            req = SNSIGNRequest(
+                tbs_message_length=len(tbs_message),
+                tbs_message=tbs_message,
+                its_aid=36,
+                permissions_length=0,
+                permissions=b"",
+            )
+            sign_service.sign_cam(req)
+    else:
+        while time.monotonic_ns() < t_warmup_end:
+            req = SNVERIFYRequest(
+                sec_header_length=0,
+                sec_header=b"",
+                message_length=len(signed_message),
+                message=signed_message,
+            )
+            verify_service.verify(req)
+
+    # Measurement
+    print(f"  Measurement phase ({args.duration}s)...")
+    latencies = []
+    t_start = time.monotonic_ns()
+    deadline = t_start + args.duration * 10**9
+    count = 0
+
+    if is_sign:
+        while time.monotonic_ns() < deadline:
+            req = SNSIGNRequest(
+                tbs_message_length=len(tbs_message),
+                tbs_message=tbs_message,
+                its_aid=36,
+                permissions_length=0,
+                permissions=b"",
+            )
+            t0 = time.monotonic_ns()
+            sign_service.sign_cam(req)
+            t1 = time.monotonic_ns()
+            latencies.append((t1 - t0) / 1000)
+            count += 1
+    else:
+        while time.monotonic_ns() < deadline:
+            req = SNVERIFYRequest(
+                sec_header_length=0,
+                sec_header=b"",
+                message_length=len(signed_message),
+                message=signed_message,
+            )
+            t0 = time.monotonic_ns()
+            verify_service.verify(req)
+            t1 = time.monotonic_ns()
+            latencies.append((t1 - t0) / 1000)
+            count += 1
+
+    t_end = time.monotonic_ns()
+    elapsed = (t_end - t_start) / 1e9
+    throughput = count / elapsed
+
+    label = "Sign" if is_sign else "Verify"
+    print(f"  {label}: {count} ops ({throughput:.0f}/s)")
+
+    return compute_stats(args, args.mode, count, elapsed, throughput, latencies, latencies)
+
+
 
 # ── Statistics ──────────────────────────────────────────────────────────────
 def compute_stats(args, benchmark, total, elapsed, throughput, latencies, sign_latencies):
@@ -923,21 +929,29 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Benchmark Modes:
-  tx             Full-stack TX throughput (B1)
-  rx             Full-stack RX throughput (B2)
-  concurrent     Concurrent TX/RX throughput (B3)
-  codec-encode   ASN.1 CAM encode throughput (B4)
-  codec-decode   ASN.1 CAM decode throughput (B4)
+  tx             Send CAMs at max rate, measure wire throughput
+                 (also used as remote sender for rx mode)
+  rx             Receive-only: listen for CAMs from a remote sender
+                 and measure RX decode throughput
+  concurrent     Self-contained TX+RX on same machine (two stacks)
+  codec-encode     ASN.1 CAM encode throughput (in-memory)
+  codec-decode     ASN.1 CAM decode throughput (in-memory)
+  security-sign    ECDSA-P256 signing throughput (in-memory, no networking)
+  security-verify  ECDSA-P256 verification throughput (in-memory, no networking)
 
 Examples:
   sudo python3 benchmark.py --mode tx --security off --duration 60
   sudo pypy3   benchmark.py --mode tx --security on  --duration 60 --warmup 15
   python3       benchmark.py --mode codec-encode --duration 60
+
+Cross-machine RX example:
+  Machine A (sender):   sudo python3 benchmark.py --mode tx --interface eth0
+  Machine B (receiver): sudo python3 benchmark.py --mode rx --interface eth0
         """,
     )
     parser.add_argument(
         "--mode",
-        choices=["tx", "rx", "concurrent", "codec-encode", "codec-decode"],
+        choices=["tx", "rx", "concurrent", "codec-encode", "codec-decode", "security-sign", "security-verify"],
         required=True,
         help="Benchmark mode",
     )
@@ -1014,6 +1028,8 @@ def main():
         row = bench_concurrent(args)
     elif args.mode in ("codec-encode", "codec-decode"):
         row = bench_codec(args)
+    elif args.mode in ("security-sign", "security-verify"):
+        row = bench_security(args)
     else:
         print(f"Unknown mode: {args.mode}")
         sys.exit(1)

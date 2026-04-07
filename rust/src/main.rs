@@ -73,11 +73,11 @@ use rustflexstack::security::security_asn::ieee1609_dot2_base_types::{
 #[command(
     name = "flexstack-bench",
     about = "FlexStack Benchmark — Rust",
-    long_about = "Benchmark harness for RustFlexStack measuring TX/RX throughput and codec performance."
+    long_about = "Benchmark harness for RustFlexStack measuring TX/RX throughput and codec performance.\n\nModes:\n  tx              Send CAMs at max rate, measure wire throughput (also used as remote sender for rx)\n  rx              Receive-only: listen for CAMs from a remote sender and measure RX throughput\n  concurrent      Self-contained TX+RX on same machine (two stacks)\n  codec-encode    ASN.1 CAM encode throughput (in-memory)\n  codec-decode    ASN.1 CAM decode throughput (in-memory)\n  security-sign   ECDSA-P256 signing throughput (in-memory, no networking)\n  security-verify ECDSA-P256 verification throughput (in-memory, no networking)\n\nCross-machine RX example:\n  Machine A (sender):   sudo ./flexstack-bench --mode tx --interface eth0\n  Machine B (receiver): sudo ./flexstack-bench --mode rx --interface eth0"
 )]
 struct Args {
     /// Benchmark mode
-    #[arg(long, value_parser = ["tx", "rx", "concurrent", "codec-encode", "codec-decode"])]
+    #[arg(long, value_parser = ["tx", "rx", "concurrent", "codec-encode", "codec-decode", "security-sign", "security-verify"])]
     mode: String,
 
     /// Security mode (ECDSA-P256 signing/verification)
@@ -803,43 +803,18 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
     }
 }
 
-// ── Benchmark: RX Throughput ────────────────────────────────────────────────
+// ── Benchmark: RX Throughput (receive-only) ─────────────────────────────────
+// Listens on the network interface for incoming CAMs sent by a remote sender
+// (e.g. another machine running `--mode tx`). No internal TX stack is spawned.
 fn bench_rx(args: &Args) -> BenchmarkResult {
-    // TX stack: generates CAMs at max rate in background
-    let tx_mac = random_mac();
-    let mut tx_mib = Mib::new();
-    tx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(tx_mac));
-    tx_mib.itsGnBeaconServiceRetransmitTimer = 0;
-    let tx_station_id = u32::from_be_bytes([tx_mac[2], tx_mac[3], tx_mac[4], tx_mac[5]]);
-    let security_on = args.security == "on";
-
-    let (tx_sign_svc, rx_sign_svc) = if security_on {
-        let (tx, rx) = setup_security_pair();
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, None);
-
-    let mut tx_epv = LongPositionVector::decode([0u8; 24]);
-    tx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
-    tx_gn.update_position_vector(tx_epv);
-
-    // RX stack: receives and decodes CAMs
-    let rx_mac = {
-        let mut m = random_mac();
-        m[5] = m[5].wrapping_add(1); // ensure different MAC
-        m
-    };
+    let rx_mac = random_mac();
     let mut rx_mib = Mib::new();
     rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
     rx_mib.itsGnBeaconServiceRetransmitTimer = 0;
+    let security_on = args.security == "on";
 
-    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None);
-
-    let mut rx_epv = LongPositionVector::decode([0u8; 24]);
-    rx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
-    rx_gn.update_position_vector(rx_epv);
+    let sign_svc = if security_on { Some(setup_security()) } else { None };
+    let (_rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, sign_svc, None);
 
     // Register RX on BTP port 2001
     let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
@@ -847,34 +822,18 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
 
     thread::sleep(Duration::from_millis(50));
 
-    let coder_tx = CamCoder::new();
-    let template = make_cam(tx_station_id);
-    let stop_tx = Arc::new(AtomicBool::new(false));
-
-    // Warm-up: TX sends, RX receives but discards
-    println!("  Warm-up phase ({}s)...", args.warmup);
+    // Warm-up: receive and discard
+    println!("  Warm-up phase ({}s) — waiting for packets from remote sender...", args.warmup);
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
+    let mut warmup_count = 0u64;
     while Instant::now() < warmup_end {
-        if let Ok(data) = coder_tx.encode(&template) {
-            tx_btp.send_btp_data_request(cam_btp_request(data, security_on));
+        match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(_) => { warmup_count += 1; }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
-        // Drain RX during warmup
-        while cam_ind_rx.try_recv().is_ok() {}
     }
-
-    // Start TX background thread
-    let tx_btp_bg = tx_btp.clone();
-    let stop_tx_clone = stop_tx.clone();
-    let security_on_bg = security_on;
-    thread::spawn(move || {
-        let coder = CamCoder::new();
-        let template = make_cam(tx_station_id);
-        while !stop_tx_clone.load(Ordering::Relaxed) {
-            if let Ok(data) = coder.encode(&template) {
-                tx_btp_bg.send_btp_data_request(cam_btp_request(data, security_on_bg));
-            }
-        }
-    });
+    println!("  Warm-up received {} packets", warmup_count);
 
     // Measurement: collect RX decode latencies
     println!("  Measurement phase ({}s)...", args.duration);
@@ -902,9 +861,6 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-
-    stop_tx.store(true, Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(200));
 
     let elapsed = bench_start.elapsed().as_secs_f64();
     let total = latencies.len() as u64;
@@ -1000,6 +956,128 @@ fn bench_codec(args: &Args) -> BenchmarkResult {
     }
 }
 
+// ── Benchmark: Security Layer (Sign / Verify) ──────────────────────────────
+fn bench_security(args: &Args) -> BenchmarkResult {
+    let is_sign = args.mode == "security-sign";
+    let coder = CamCoder::new();
+    let station_id = 12345u32;
+    let template = make_cam(station_id);
+
+    let encoded = coder.encode(&template).expect("Failed to encode template CAM");
+    println!("  CAM payload size: {} bytes", encoded.len());
+
+    // Build a realistic GN packet payload (CommonHeader + payload) to sign
+    // This is what the sign middleware receives: everything after BasicHeader.
+    // We use the raw encoded CAM as the tbs_message, matching the real stack path.
+    let tbs_message = encoded.clone();
+
+    let sign_svc = setup_security();
+
+    // Pre-sign one message to get a signed envelope for the verify benchmark
+    let signed_message = {
+        let request = SNSignRequest {
+            tbs_message: tbs_message.clone(),
+            its_aid: 36,
+            permissions: vec![],
+            generation_location: None,
+        };
+        let mut s = sign_svc.lock().unwrap();
+        s.sign_request(&request).sec_message
+    };
+    println!("  Signed message size: {} bytes", signed_message.len());
+
+    // Warm-up
+    println!("  Warm-up phase ({}s)...", args.warmup);
+    let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
+    if is_sign {
+        while Instant::now() < warmup_end {
+            let request = SNSignRequest {
+                tbs_message: tbs_message.clone(),
+                its_aid: 36,
+                permissions: vec![],
+                generation_location: None,
+            };
+            let mut s = sign_svc.lock().unwrap();
+            let _ = s.sign_request(&request);
+        }
+    } else {
+        while Instant::now() < warmup_end {
+            let request = SNVerifyRequest {
+                message: signed_message.clone(),
+            };
+            let mut s = sign_svc.lock().unwrap();
+            let s = &mut *s;
+            let _ = verify_message(&request, &s.backend, &mut s.cert_library);
+        }
+    }
+
+    // Measurement
+    println!("  Measurement phase ({}s)...", args.duration);
+    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
+    let bench_start = Instant::now();
+    let bench_end = bench_start + Duration::from_secs(args.duration);
+
+    if is_sign {
+        while Instant::now() < bench_end {
+            let request = SNSignRequest {
+                tbs_message: tbs_message.clone(),
+                its_aid: 36,
+                permissions: vec![],
+                generation_location: None,
+            };
+            let t0 = Instant::now();
+            {
+                let mut s = sign_svc.lock().unwrap();
+                let _ = s.sign_request(&request);
+            }
+            let t1 = Instant::now();
+            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
+        }
+    } else {
+        while Instant::now() < bench_end {
+            let request = SNVerifyRequest {
+                message: signed_message.clone(),
+            };
+            let t0 = Instant::now();
+            {
+                let mut s = sign_svc.lock().unwrap();
+                let s = &mut *s;
+                let _ = verify_message(&request, &s.backend, &mut s.cert_library);
+            }
+            let t1 = Instant::now();
+            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
+        }
+    }
+
+    let elapsed = bench_start.elapsed().as_secs_f64();
+    let total = latencies.len() as u64;
+    let throughput = total as f64 / elapsed;
+
+    let label = if is_sign { "Sign" } else { "Verify" };
+    println!("  {}: {} ops ({:.0}/s)", label, total, throughput);
+
+    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
+        compute_stats(&mut latencies);
+
+    BenchmarkResult {
+        run_id: args.run_id,
+        platform: args.platform.clone(),
+        security: "on".to_string(), // Security is the thing being measured
+        benchmark: args.mode.clone(),
+        duration_s: elapsed,
+        total_cams: total,
+        throughput,
+        latency_mean: lat_mean,
+        latency_std: lat_std,
+        latency_p50: lat_p50,
+        latency_p95: lat_p95,
+        latency_p99: lat_p99,
+        latency_min: lat_min,
+        latency_max: lat_max,
+        sign_latency_mean: lat_mean,
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 fn main() {
     let args = Args::parse();
@@ -1022,6 +1100,7 @@ fn main() {
         "rx" => bench_rx(&args),
         "concurrent" => bench_concurrent(&args),
         "codec-encode" | "codec-decode" => bench_codec(&args),
+        "security-sign" | "security-verify" => bench_security(&args),
         _ => {
             eprintln!("Unknown mode: {}", args.mode);
             std::process::exit(1);

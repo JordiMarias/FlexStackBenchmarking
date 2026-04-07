@@ -169,6 +169,15 @@ for IMPL in rust cpython pypy; do
   run_cell "$IMPL" "off" "codec-decode"
 done
 
+# B5: Security Layer throughput (sign + verify, in-memory)
+echo "================================================================"
+echo "  B5: Security Layer Throughput (Sign + Verify)"
+echo "================================================================"
+for IMPL in rust cpython pypy; do
+  run_cell "$IMPL" "on" "security-sign"
+  run_cell "$IMPL" "on" "security-verify"
+done
+
 TOTAL_END=$(date +%s)
 TOTAL_ELAPSED=$((TOTAL_END - TOTAL_START))
 TOTAL_HOURS=$((TOTAL_ELAPSED / 3600))
