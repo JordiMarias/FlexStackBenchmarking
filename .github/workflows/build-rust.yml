@@ -37,22 +37,9 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      - name: Install cross-compilation tools (aarch64)
+      - name: Install cross (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-          wget -qO- https://musl.cc/aarch64-linux-musl-cross.tgz | sudo tar xz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-
-      - name: Configure cargo for aarch64 cross-linker
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-musl-gcc"
-          EOF
+        run: cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -60,11 +47,19 @@ jobs:
           workspaces: rust
           key: ${{ matrix.target }}
 
-      - name: Build release binary
+      - name: Build release binary (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
         working-directory: rust
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
         run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build release binary (aarch64 via cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        working-directory: rust
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Verify static linking
         run: |
