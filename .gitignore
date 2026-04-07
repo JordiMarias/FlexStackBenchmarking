@@ -1,0 +1,31 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Rust
+rust/target/
+
+# Certificates (regenerated per run)
+certs/*.cert
+certs/*.pem
+certs/*.key
+
+# Benchmark results (keep .gitkeep only)
+results/*.csv
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+next_steps2.md

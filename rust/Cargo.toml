@@ -1,0 +1,19 @@
+[package]
+name = "flexstack-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness for RustFlexStack"
+
+[[bin]]
+name = "flexstack-bench"
+path = "src/main.rs"
+
+[dependencies]
+rustflexstack = "0.2.1"
+clap = { version = "4", features = ["derive"] }
+rasn = "0.26"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
