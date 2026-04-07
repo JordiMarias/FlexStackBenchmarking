@@ -2,12 +2,12 @@ name: Build Rust Binaries
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "rust/**"
       - ".github/workflows/build-rust.yml"
   pull_request:
-    branches: [main]
+    branches: [master]
     paths:
       - "rust/**"
       - ".github/workflows/build-rust.yml"

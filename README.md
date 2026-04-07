@@ -2,7 +2,6 @@
 
 Rigorous benchmarking harness for [V2X FlexStack](https://flexstack.eu/) performance evaluation across Python (CPython, PyPy) and Rust implementations.
 
-Designed for a Q1 journal paper with reproducible results, statistical rigor (30 runs per cell, 95% CI), and publication-quality output.
 
 ## Project Structure
 
