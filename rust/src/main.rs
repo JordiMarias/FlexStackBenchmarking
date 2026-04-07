@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,22 +36,24 @@ use rustflexstack::facilities::ca_basic_service::cam_coder::{
     VehicleLengthConfidenceIndication, VehicleLengthValue, VehicleWidth, Wgs84AngleValue, YawRate,
     YawRateConfidence, YawRateValue,
 };
+use rustflexstack::geonet::basic_header::{BasicHeader, BasicNH};
 use rustflexstack::geonet::gn_address::{GNAddress, M, MID, ST};
 use rustflexstack::geonet::mib::Mib;
 use rustflexstack::geonet::position_vector::LongPositionVector;
 use rustflexstack::geonet::router::{Router as GNRouter, RouterHandle};
 use rustflexstack::geonet::service_access_point::{
-    Area, CommonNH, CommunicationProfile, GNDataIndication, GNDataRequest, HeaderSubType,
+    Area, CommonNH, CommunicationProfile, HeaderSubType,
     HeaderType, PacketTransportType, TopoBroadcastHST, TrafficClass,
 };
 use rustflexstack::link_layer::raw_link_layer::RawLinkLayer;
-use rustflexstack::security::sn_sap::SecurityProfile;
+use rustflexstack::security::sn_sap::{ReportVerify, SNSignRequest, SNVerifyRequest, SecurityProfile};
 
 // Security imports
 use rustflexstack::security::certificate::OwnCertificate;
 use rustflexstack::security::certificate_library::CertificateLibrary;
 use rustflexstack::security::ecdsa_backend::EcdsaBackend;
 use rustflexstack::security::sign_service::SignService;
+use rustflexstack::security::verify_service::{verify_message, VerifyEvent};
 
 // ASN.1 types for certificate generation
 use rasn::prelude::*;
@@ -320,31 +322,144 @@ fn cam_btp_request(data: Vec<u8>, security_on: bool) -> BTPDataRequest {
     }
 }
 
-fn wire_routers(
-    gn: &RouterHandle,
-    btp: &BTPRouterHandle,
-    ll_rx: mpsc::Receiver<Vec<u8>>,
-    gn_btp_rx: mpsc::Receiver<GNDataIndication>,
-    btp_gn_rx: mpsc::Receiver<GNDataRequest>,
-) {
-    let g1 = gn.clone();
-    thread::spawn(move || {
-        while let Ok(p) = ll_rx.recv() {
-            g1.send_incoming_packet(p);
+/// Spawn a complete stack: GN + BTP + LinkLayer, with optional security middleware.
+/// Returns (gn_handle, btp_handle).
+/// If `tx_wire_counter` is Some, it is incremented each time a packet is handed to the LL.
+fn spawn_stack(
+    mib: Mib,
+    mac: [u8; 6],
+    iface: &str,
+    sign_svc: Option<Arc<Mutex<SignService>>>,
+    tx_wire_counter: Option<Arc<AtomicU64>>,
+) -> (RouterHandle, BTPRouterHandle) {
+    // GN router is always spawned WITHOUT security params — security is a middleware
+    let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = GNRouter::spawn(mib, None, None, None);
+    let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
+
+    let (ll_to_gn_tx, ll_to_gn_rx) = mpsc::channel::<Vec<u8>>();
+
+    if let Some(svc) = sign_svc {
+        // ── TX path: GN → sign → LL ─────────────────────────────────────
+        let (secured_ll_tx, secured_ll_rx) = mpsc::channel::<Vec<u8>>();
+        let sign_svc_tx = Arc::clone(&svc);
+        let wire_cnt = tx_wire_counter.clone();
+        thread::spawn(move || {
+            while let Ok(packet) = gn_to_ll_rx.recv() {
+                if packet.len() < 4 {
+                    let _ = secured_ll_tx.send(packet);
+                    if let Some(ref c) = wire_cnt { c.fetch_add(1, Ordering::Relaxed); }
+                    continue;
+                }
+                let bh_bytes: [u8; 4] = packet[0..4].try_into().unwrap();
+                let bh = BasicHeader::decode(bh_bytes);
+                match bh.nh {
+                    BasicNH::CommonHeader if packet.len() > 4 => {
+                        let request = SNSignRequest {
+                            tbs_message: packet[4..].to_vec(),
+                            its_aid: 36,
+                            permissions: vec![],
+                            generation_location: None,
+                        };
+                        let sec_message = {
+                            let mut s = sign_svc_tx.lock().unwrap();
+                            s.sign_request(&request).sec_message
+                        };
+                        let mut new_bh = bh;
+                        new_bh.nh = BasicNH::SecuredPacket;
+                        let secured: Vec<u8> = new_bh.encode().iter().copied()
+                            .chain(sec_message.iter().copied()).collect();
+                        let _ = secured_ll_tx.send(secured);
+                        if let Some(ref c) = wire_cnt { c.fetch_add(1, Ordering::Relaxed); }
+                    }
+                    _ => {
+                        let _ = secured_ll_tx.send(packet);
+                        if let Some(ref c) = wire_cnt { c.fetch_add(1, Ordering::Relaxed); }
+                    }
+                }
+            }
+        });
+        // LL uses the signed output channel
+        RawLinkLayer::new(ll_to_gn_tx, secured_ll_rx, iface, mac).start();
+        // ── RX path: LL → verify → GN ───────────────────────────────────
+        let g1 = gn_handle.clone();
+        let verify_svc = svc;
+        thread::spawn(move || {
+            while let Ok(packet) = ll_to_gn_rx.recv() {
+                if packet.len() < 4 {
+                    g1.send_incoming_packet(packet);
+                    continue;
+                }
+                let bh_bytes: [u8; 4] = packet[0..4].try_into().unwrap();
+                let bh = BasicHeader::decode(bh_bytes);
+                match bh.nh {
+                    BasicNH::SecuredPacket if packet.len() > 4 => {
+                        let request = SNVerifyRequest {
+                            message: packet[4..].to_vec(),
+                        };
+                        let (confirm, _events) = {
+                            let mut s = verify_svc.lock().unwrap();
+                            let s = &mut *s;
+                            let result = verify_message(&request, &s.backend, &mut s.cert_library);
+                            for event in &result.1 {
+                                match event {
+                                    VerifyEvent::UnknownAt(h8) => s.notify_unknown_at(h8),
+                                    VerifyEvent::InlineP2pcdRequest(h3s) => s.notify_inline_p2pcd_request(h3s),
+                                    VerifyEvent::ReceivedCaCertificate(cert) => s.notify_received_ca_certificate(cert.as_ref().clone()),
+                                }
+                            }
+                            result
+                        };
+                        if confirm.report == ReportVerify::Success {
+                            let mut new_bh = bh;
+                            new_bh.nh = BasicNH::CommonHeader;
+                            let plain: Vec<u8> = new_bh.encode().iter().copied()
+                                .chain(confirm.plain_message.iter().copied()).collect();
+                            g1.send_incoming_packet(plain);
+                        }
+                    }
+                    _ => g1.send_incoming_packet(packet),
+                }
+            }
+        });
+    } else {
+        // No security — wire directly, with optional counter
+        let wire_cnt = tx_wire_counter;
+        if let Some(cnt) = wire_cnt {
+            // Intercept GN→LL to count packets
+            let (counted_ll_tx, counted_ll_rx) = mpsc::channel::<Vec<u8>>();
+            thread::spawn(move || {
+                while let Ok(packet) = gn_to_ll_rx.recv() {
+                    cnt.fetch_add(1, Ordering::Relaxed);
+                    let _ = counted_ll_tx.send(packet);
+                }
+            });
+            RawLinkLayer::new(ll_to_gn_tx, counted_ll_rx, iface, mac).start();
+        } else {
+            RawLinkLayer::new(ll_to_gn_tx, gn_to_ll_rx, iface, mac).start();
         }
-    });
-    let b1 = btp.clone();
+        let g1 = gn_handle.clone();
+        thread::spawn(move || {
+            while let Ok(p) = ll_to_gn_rx.recv() {
+                g1.send_incoming_packet(p);
+            }
+        });
+    }
+
+    // GN ↔ BTP
+    let b1 = btp_handle.clone();
     thread::spawn(move || {
-        while let Ok(i) = gn_btp_rx.recv() {
+        while let Ok(i) = gn_to_btp_rx.recv() {
             b1.send_gn_data_indication(i);
         }
     });
-    let g2 = gn.clone();
+    let g2 = gn_handle.clone();
     thread::spawn(move || {
-        while let Ok(r) = btp_gn_rx.recv() {
+        while let Ok(r) = btp_to_gn_rx.recv() {
             g2.send_gn_data_request(r);
         }
     });
+
+    (gn_handle, btp_handle)
 }
 
 // ── Security setup ──────────────────────────────────────────────────────────
@@ -403,7 +518,7 @@ fn make_at_tbs() -> TbsCert {
     )
 }
 
-fn setup_security() -> (SignService, EcdsaBackend, CertificateLibrary) {
+fn setup_security() -> Arc<Mutex<SignService>> {
     let mut backend = EcdsaBackend::new();
 
     // Generate certificate chain in-memory
@@ -412,26 +527,56 @@ fn setup_security() -> (SignService, EcdsaBackend, CertificateLibrary) {
     let at1 = OwnCertificate::initialize_issued(&mut backend, make_at_tbs(), &aa);
     let at2 = OwnCertificate::initialize_issued(&mut backend, make_at_tbs(), &aa);
 
-    let verify_backend = EcdsaBackend::new();
-
-    let sign_cert_lib = CertificateLibrary::new(
+    let cert_lib = CertificateLibrary::new(
         &backend,
-        vec![root.cert.clone()],
-        vec![aa.cert.clone()],
-        vec![at1.cert.clone(), at2.cert.clone()],
-    );
-
-    let verify_cert_lib = CertificateLibrary::new(
-        &verify_backend,
         vec![root.cert],
         vec![aa.cert],
         vec![at1.cert.clone(), at2.cert],
     );
 
-    let mut sign_service = SignService::new(backend, sign_cert_lib);
+    let mut sign_service = SignService::new(backend, cert_lib);
     sign_service.add_own_certificate(at1);
 
-    (sign_service, verify_backend, verify_cert_lib)
+    Arc::new(Mutex::new(sign_service))
+}
+
+/// Create two independent SignService instances sharing the same cert chain.
+/// TX gets at1 for signing, RX gets at2. Both can verify each other's packets.
+/// Separate backends = no Mutex contention between stacks.
+fn setup_security_pair() -> (Arc<Mutex<SignService>>, Arc<Mutex<SignService>>) {
+    let mut backend = EcdsaBackend::new();
+
+    let root = OwnCertificate::initialize_self_signed(&mut backend, make_root_tbs());
+    let aa = OwnCertificate::initialize_issued(&mut backend, make_root_tbs(), &root);
+    let at1 = OwnCertificate::initialize_issued(&mut backend, make_at_tbs(), &aa);
+    let at2 = OwnCertificate::initialize_issued(&mut backend, make_at_tbs(), &aa);
+
+    // TX service — signs with at1
+    let tx_cert_lib = CertificateLibrary::new(
+        &backend,
+        vec![root.cert.clone()],
+        vec![aa.cert.clone()],
+        vec![at1.cert.clone(), at2.cert.clone()],
+    );
+    let mut tx_sign = SignService::new(backend, tx_cert_lib);
+    tx_sign.add_own_certificate(at1);
+
+    // RX service — independent backend, same cert chain for verification, signs with at2
+    let mut rx_backend = EcdsaBackend::new();
+    let rx_root = OwnCertificate::initialize_self_signed(&mut rx_backend, make_root_tbs());
+    let rx_aa = OwnCertificate::initialize_issued(&mut rx_backend, make_root_tbs(), &rx_root);
+    let rx_at2 = OwnCertificate::initialize_issued(&mut rx_backend, make_at_tbs(), &rx_aa);
+
+    let rx_cert_lib = CertificateLibrary::new(
+        &rx_backend,
+        vec![root.cert, rx_root.cert],
+        vec![aa.cert, rx_aa.cert],
+        vec![at2.cert, rx_at2.cert.clone()],
+    );
+    let mut rx_sign = SignService::new(rx_backend, rx_cert_lib);
+    rx_sign.add_own_certificate(rx_at2);
+
+    (Arc::new(Mutex::new(tx_sign)), Arc::new(Mutex::new(rx_sign)))
 }
 
 // ── Benchmark: TX Throughput ────────────────────────────────────────────────
@@ -444,19 +589,9 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
     let station_id = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
     let security_on = args.security == "on";
 
-    // Spawn routers — with or without security
-    let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = if security_on {
-        let (sign_svc, verify_be, verify_cl) = setup_security();
-        GNRouter::spawn(mib, Some(sign_svc), Some(verify_be), Some(verify_cl))
-    } else {
-        GNRouter::spawn(mib, None, None, None)
-    };
-
-    let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
-
-    let (ll_to_gn_tx, ll_to_gn_rx) = mpsc::channel::<Vec<u8>>();
-    RawLinkLayer::new(ll_to_gn_tx, gn_to_ll_rx, &args.interface, mac).start();
-    wire_routers(&gn_handle, &btp_handle, ll_to_gn_rx, gn_to_btp_rx, btp_to_gn_rx);
+    let wire_counter = Arc::new(AtomicU64::new(0));
+    let sign_svc = if security_on { Some(setup_security()) } else { None };
+    let (gn_handle, btp_handle) = spawn_stack(mib, mac, &args.interface, sign_svc, Some(Arc::clone(&wire_counter)));
 
     // Seed position vector
     let mut epv = LongPositionVector::decode([0u8; 24]);
@@ -466,8 +601,9 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let coder = CamCoder::new();
     let template = make_cam(station_id);
+    let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // Warm-up
+    // Warm-up: feed packets to saturate the pipeline
     println!("  Warm-up phase ({}s)...", args.warmup);
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
     while Instant::now() < warmup_end {
@@ -476,27 +612,29 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
         }
     }
 
-    // Measurement
-    println!("  Measurement phase ({}s)...", args.duration);
-    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
-    let bench_start = Instant::now();
-    let bench_end = bench_start + Duration::from_secs(args.duration);
-
-    while Instant::now() < bench_end {
-        let t0 = Instant::now();
-        if let Ok(data) = coder.encode(&make_cam(station_id)) {
-            btp_handle.send_btp_data_request(cam_btp_request(data, security_on));
-            let t1 = Instant::now();
-            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
+    // Background feeder thread keeps the pipeline saturated during measurement
+    let btp_bg = btp_handle.clone();
+    let stop_clone = stop_flag.clone();
+    thread::spawn(move || {
+        let coder = CamCoder::new();
+        let template = make_cam(station_id);
+        while !stop_clone.load(Ordering::Relaxed) {
+            if let Ok(data) = coder.encode(&template) {
+                btp_bg.send_btp_data_request(cam_btp_request(data, security_on));
+            }
         }
-    }
+    });
 
+    // Measurement: snapshot wire counter at start and end
+    println!("  Measurement phase ({}s)...", args.duration);
+    wire_counter.store(0, Ordering::SeqCst);
+    let bench_start = Instant::now();
+    thread::sleep(Duration::from_secs(args.duration));
+    let total = wire_counter.load(Ordering::SeqCst);
     let elapsed = bench_start.elapsed().as_secs_f64();
-    let total = latencies.len() as u64;
-    let throughput = total as f64 / elapsed;
 
-    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
-        compute_stats(&mut latencies);
+    stop_flag.store(true, Ordering::Relaxed);
+    let throughput = total as f64 / elapsed;
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -506,60 +644,73 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
         duration_s: elapsed,
         total_cams: total,
         throughput,
-        latency_mean: lat_mean,
-        latency_std: lat_std,
-        latency_p50: lat_p50,
-        latency_p95: lat_p95,
-        latency_p99: lat_p99,
-        latency_min: lat_min,
-        latency_max: lat_max,
+        latency_mean: 0.0,
+        latency_std: 0.0,
+        latency_p50: 0.0,
+        latency_p95: 0.0,
+        latency_p99: 0.0,
+        latency_min: 0.0,
+        latency_max: 0.0,
         sign_latency_mean: 0.0,
     }
 }
 
 // ── Benchmark: Concurrent TX/RX ────────────────────────────────────────────
 fn bench_concurrent(args: &Args) -> BenchmarkResult {
-    let mac = random_mac();
-    let mut mib = Mib::new();
-    mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(mac));
-    mib.itsGnBeaconServiceRetransmitTimer = 0;
-
-    let station_id = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
+    // Two separate stacks (different GN addresses) so the GN router's
+    // Duplicate Address Detection doesn't drop loopback packets.
+    let tx_mac = random_mac();
+    let mut tx_mib = Mib::new();
+    tx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(tx_mac));
+    tx_mib.itsGnBeaconServiceRetransmitTimer = 0;
+    let station_id = u32::from_be_bytes([tx_mac[2], tx_mac[3], tx_mac[4], tx_mac[5]]);
     let security_on = args.security == "on";
 
-    let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = if security_on {
-        let (sign_svc, verify_be, verify_cl) = setup_security();
-        GNRouter::spawn(mib, Some(sign_svc), Some(verify_be), Some(verify_cl))
+    let wire_counter = Arc::new(AtomicU64::new(0));
+
+    let (tx_sign_svc, rx_sign_svc) = if security_on {
+        let (tx, rx) = setup_security_pair();
+        (Some(tx), Some(rx))
     } else {
-        GNRouter::spawn(mib, None, None, None)
+        (None, None)
     };
+    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, Some(Arc::clone(&wire_counter)));
 
-    let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
+    let mut tx_epv = LongPositionVector::decode([0u8; 24]);
+    tx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
+    tx_gn.update_position_vector(tx_epv);
 
-    let (ll_to_gn_tx, ll_to_gn_rx) = mpsc::channel::<Vec<u8>>();
-    RawLinkLayer::new(ll_to_gn_tx, gn_to_ll_rx, &args.interface, mac).start();
-    wire_routers(&gn_handle, &btp_handle, ll_to_gn_rx, gn_to_btp_rx, btp_to_gn_rx);
+    // RX stack
+    let rx_mac = {
+        let mut m = random_mac();
+        m[5] = m[5].wrapping_add(1);
+        m
+    };
+    let mut rx_mib = Mib::new();
+    rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
+    rx_mib.itsGnBeaconServiceRetransmitTimer = 0;
 
-    let mut epv = LongPositionVector::decode([0u8; 24]);
-    epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
-    gn_handle.update_position_vector(epv);
-    thread::sleep(Duration::from_millis(50));
+    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None);
+
+    let mut rx_epv = LongPositionVector::decode([0u8; 24]);
+    rx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
+    rx_gn.update_position_vector(rx_epv);
 
     // Register RX on BTP port 2001
     let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
-    btp_handle.register_port(2001, cam_ind_tx);
+    rx_btp.register_port(2001, cam_ind_tx);
+
+    thread::sleep(Duration::from_millis(50));
 
     // Shared counters
     let rx_count = Arc::new(AtomicU64::new(0));
     let rx_errors = Arc::new(AtomicU64::new(0));
-    let rx_dec_us_total = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
     // RX thread
     {
         let cnt = rx_count.clone();
         let err = rx_errors.clone();
-        let dec_sum = rx_dec_us_total.clone();
         let stop = stop_flag.clone();
         thread::spawn(move || {
             let coder = CamCoder::new();
@@ -569,7 +720,6 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
                 }
                 match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
                     Ok(ind) => {
-                        let t0 = Instant::now();
                         match coder.decode(&ind.data) {
                             Ok(_) => {
                                 cnt.fetch_add(1, Ordering::Relaxed);
@@ -578,8 +728,6 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
                                 err.fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        dec_sum
-                            .fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -595,46 +743,46 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
     while Instant::now() < warmup_end {
         if let Ok(data) = coder.encode(&make_cam(station_id)) {
-            btp_handle.send_btp_data_request(cam_btp_request(data, security_on));
+            tx_btp.send_btp_data_request(cam_btp_request(data, security_on));
         }
     }
 
-    // Reset counters after warm-up
-    rx_count.store(0, Ordering::Relaxed);
-    rx_errors.store(0, Ordering::Relaxed);
-    rx_dec_us_total.store(0, Ordering::Relaxed);
+    // Background feeder thread keeps the pipeline saturated
+    let btp_bg = tx_btp.clone();
+    let stop_feed = Arc::new(AtomicBool::new(false));
+    let stop_feed_clone = stop_feed.clone();
+    thread::spawn(move || {
+        let coder = CamCoder::new();
+        let template = make_cam(station_id);
+        while !stop_feed_clone.load(Ordering::Relaxed) {
+            if let Ok(data) = coder.encode(&template) {
+                btp_bg.send_btp_data_request(cam_btp_request(data, security_on));
+            }
+        }
+    });
 
-    // Measurement
+    // Reset counters, then snapshot during measurement
+    wire_counter.store(0, Ordering::SeqCst);
+    rx_count.store(0, Ordering::SeqCst);
+    rx_errors.store(0, Ordering::SeqCst);
+
     println!("  Measurement phase ({}s)...", args.duration);
-    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
     let bench_start = Instant::now();
-    let bench_end = bench_start + Duration::from_secs(args.duration);
-
-    while Instant::now() < bench_end {
-        let t0 = Instant::now();
-        if let Ok(data) = coder.encode(&make_cam(station_id)) {
-            btp_handle.send_btp_data_request(cam_btp_request(data, security_on));
-            let t1 = Instant::now();
-            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
-        }
-    }
-
-    stop_flag.store(true, Ordering::Relaxed);
-    // Give RX thread time to drain
-    thread::sleep(Duration::from_millis(500));
-
+    thread::sleep(Duration::from_secs(args.duration));
+    let tx_total = wire_counter.load(Ordering::SeqCst);
+    let rx_total = rx_count.load(Ordering::SeqCst);
     let elapsed = bench_start.elapsed().as_secs_f64();
-    let tx_total = latencies.len() as u64;
+
+    stop_feed.store(true, Ordering::Relaxed);
+    stop_flag.store(true, Ordering::Relaxed);
+    thread::sleep(Duration::from_millis(200));
+
     let throughput = tx_total as f64 / elapsed;
-    let rx_total = rx_count.load(Ordering::Relaxed);
 
     println!(
-        "  TX: {} CAMs ({:.0}/s), RX: {} CAMs",
-        tx_total, throughput, rx_total
+        "  TX (wire): {} CAMs ({:.0}/s), RX: {} CAMs ({:.0}/s)",
+        tx_total, throughput, rx_total, rx_total as f64 / elapsed
     );
-
-    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
-        compute_stats(&mut latencies);
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -644,13 +792,13 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
         duration_s: elapsed,
         total_cams: tx_total,
         throughput,
-        latency_mean: lat_mean,
-        latency_std: lat_std,
-        latency_p50: lat_p50,
-        latency_p95: lat_p95,
-        latency_p99: lat_p99,
-        latency_min: lat_min,
-        latency_max: lat_max,
+        latency_mean: 0.0,
+        latency_std: 0.0,
+        latency_p50: 0.0,
+        latency_p95: 0.0,
+        latency_p99: 0.0,
+        latency_min: 0.0,
+        latency_max: 0.0,
         sign_latency_mean: 0.0,
     }
 }
@@ -665,17 +813,13 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let tx_station_id = u32::from_be_bytes([tx_mac[2], tx_mac[3], tx_mac[4], tx_mac[5]]);
     let security_on = args.security == "on";
 
-    let (tx_gn, tx_gn_to_ll_rx, tx_gn_to_btp_rx) = if security_on {
-        let (sign_svc, verify_be, verify_cl) = setup_security();
-        GNRouter::spawn(tx_mib, Some(sign_svc), Some(verify_be), Some(verify_cl))
+    let (tx_sign_svc, rx_sign_svc) = if security_on {
+        let (tx, rx) = setup_security_pair();
+        (Some(tx), Some(rx))
     } else {
-        GNRouter::spawn(tx_mib, None, None, None)
+        (None, None)
     };
-
-    let (tx_btp, tx_btp_to_gn_rx) = BTPRouter::spawn(tx_mib);
-    let (tx_ll_tx, tx_ll_rx) = mpsc::channel::<Vec<u8>>();
-    RawLinkLayer::new(tx_ll_tx, tx_gn_to_ll_rx, &args.interface, tx_mac).start();
-    wire_routers(&tx_gn, &tx_btp, tx_ll_rx, tx_gn_to_btp_rx, tx_btp_to_gn_rx);
+    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, None);
 
     let mut tx_epv = LongPositionVector::decode([0u8; 24]);
     tx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
@@ -691,17 +835,7 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
     rx_mib.itsGnBeaconServiceRetransmitTimer = 0;
 
-    let (rx_gn, rx_gn_to_ll_rx, rx_gn_to_btp_rx) = if security_on {
-        let (sign_svc, verify_be, verify_cl) = setup_security();
-        GNRouter::spawn(rx_mib, Some(sign_svc), Some(verify_be), Some(verify_cl))
-    } else {
-        GNRouter::spawn(rx_mib, None, None, None)
-    };
-
-    let (rx_btp, rx_btp_to_gn_rx) = BTPRouter::spawn(rx_mib);
-    let (rx_ll_tx, rx_ll_rx) = mpsc::channel::<Vec<u8>>();
-    RawLinkLayer::new(rx_ll_tx, rx_gn_to_ll_rx, &args.interface, rx_mac).start();
-    wire_routers(&rx_gn, &rx_btp, rx_ll_rx, rx_gn_to_btp_rx, rx_btp_to_gn_rx);
+    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None);
 
     let mut rx_epv = LongPositionVector::decode([0u8; 24]);
     rx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);

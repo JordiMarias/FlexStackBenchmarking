@@ -305,13 +305,63 @@ def teardown_stack(ca_svc, link_layer, location_service):
         pass
 
 
+# ── CAM template helper ─────────────────────────────────────────────────────
+def _make_cam_value(station_id):
+    """Build a CAM value dict for encoding/sending."""
+    return {
+        "header": {"protocolVersion": 2, "messageId": 2, "stationId": station_id},
+        "cam": {
+            "generationDeltaTime": 1000,
+            "camParameters": {
+                "basicContainer": {
+                    "stationType": 5,
+                    "referencePosition": {
+                        "latitude": 415520000, "longitude": 21340000,
+                        "positionConfidenceEllipse": {
+                            "semiMajorAxisLength": 4095,
+                            "semiMinorAxisLength": 4095,
+                            "semiMajorAxisOrientation": 3601,
+                        },
+                        "altitude": {"altitudeValue": 12000, "altitudeConfidence": "unavailable"},
+                    },
+                },
+                "highFrequencyContainer": (
+                    "basicVehicleContainerHighFrequency",
+                    {
+                        "heading": {"headingValue": 900, "headingConfidence": 127},
+                        "speed": {"speedValue": 0, "speedConfidence": 127},
+                        "driveDirection": "unavailable",
+                        "vehicleLength": {"vehicleLengthValue": 1023, "vehicleLengthConfidenceIndication": "unavailable"},
+                        "vehicleWidth": 62,
+                        "longitudinalAcceleration": {"value": 161, "confidence": 102},
+                        "curvature": {"curvatureValue": 1023, "curvatureConfidence": "unavailable"},
+                        "curvatureCalculationMode": "unavailable",
+                        "yawRate": {"yawRateValue": 32767, "yawRateConfidence": "unavailable"},
+                    },
+                ),
+            },
+        },
+    }
+
+
 # ── Benchmark: TX Throughput ────────────────────────────────────────────────
 def bench_tx(args):
     """
     B1: Full-stack TX throughput.
-    Generates CAMs as fast as possible through the full stack
-    (CA Service → BTP → GeoNet → loopback).
+    Sends encoded CAMs directly via BTP → GeoNet → loopback at max rate.
+    Each btp_data_request() call is synchronous to the raw socket sendto(),
+    so the count reflects actual packets on the wire.
     """
+    from flexstack.facilities.ca_basic_service.cam_coder import CAMCoder
+    from flexstack.geonet.service_access_point import (
+        PacketTransportType, HeaderType, TopoBroadcastHST,
+        CommunicationProfile, TrafficClass, CommonNH,
+    )
+    from flexstack.btp.service_access_point import BTPDataRequest
+    from flexstack.security.security_profiles import SecurityProfile
+
+    security_on = args.security == "on"
+
     (
         ca_svc,
         link_layer,
@@ -320,38 +370,53 @@ def bench_tx(args):
         btp_router,
         station_id,
         rx_counter,
-    ) = build_stack(security_on=(args.security == "on"), interface=args.interface)
+    ) = build_stack(security_on=security_on, interface=args.interface)
 
-    # Start the CA service (it begins generating CAMs on location updates)
-    ca_svc.start()
+    # Don't start the CA service timer — we send directly via BTP
+    coder = CAMCoder()
+    cam_value = _make_cam_value(station_id)
+    encoded_cam = coder.encode(cam_value)
 
-    # Let the stack warm up
+    def make_btp_request(data):
+        return BTPDataRequest(
+            btp_type=CommonNH.BTP_B,
+            source_port=0,
+            destination_port=2001,
+            destination_port_info=0,
+            gn_packet_transport_type=PacketTransportType(
+                header_type=HeaderType.TSB,
+                header_subtype=TopoBroadcastHST.SINGLE_HOP,
+            ),
+            communication_profile=CommunicationProfile.UNSPECIFIED,
+            traffic_class=TrafficClass(scf=False, channel_offload=False, tc_id=0),
+            security_profile=(
+                SecurityProfile.COOPERATIVE_AWARENESS_MESSAGE
+                if security_on
+                else SecurityProfile.NO_SECURITY
+            ),
+            its_aid=36,
+            security_permissions=b"",
+            gn_max_hop_limit=1,
+            length=len(data),
+            data=data,
+        )
+
+    # Warm-up
     print(f"  Warm-up phase ({args.warmup}s)...")
-    time.sleep(args.warmup)
+    warmup_end = time.monotonic_ns() + args.warmup * 10**9
+    while time.monotonic_ns() < warmup_end:
+        btp_router.btp_data_request(make_btp_request(encoded_cam))
 
-    # Measurement phase: we trigger CAMs by sending rapid location updates
-    # to force the CA service to generate at maximum rate.
+    # Measurement — each call is synchronous to wire
     print(f"  Measurement phase ({args.duration}s)...")
     latencies = []
-    sign_latencies = []
     t_start = time.monotonic_ns()
     deadline = t_start + args.duration * 10**9
-
-    cam_mgmt = ca_svc.cam_transmission_management
     count = 0
 
     while time.monotonic_ns() < deadline:
         t0 = time.monotonic_ns()
-        # Trigger a location update which causes the CA service to
-        # check generation conditions and (if met) generate a CAM.
-        # We feed coordinates directly to bypass the location service period.
-        cam_mgmt.location_service_callback({
-            "latitude": POSITION_LAT + random.uniform(-0.0001, 0.0001),
-            "longitude": POSITION_LON + random.uniform(-0.0001, 0.0001),
-            "altitude": 120.0,
-            "speed": random.uniform(0, 30),
-            "heading": random.uniform(0, 360),
-        })
+        btp_router.btp_data_request(make_btp_request(encoded_cam))
         t1 = time.monotonic_ns()
         latencies.append((t1 - t0) / 1000)  # μs
         count += 1
@@ -363,54 +428,127 @@ def bench_tx(args):
     # Cleanup
     teardown_stack(ca_svc, link_layer, loc_svc)
 
-    return compute_stats(
-        args, "tx", count, elapsed, throughput, latencies, sign_latencies
-    )
+    return compute_stats(args, "tx", count, elapsed, throughput, latencies, [])
 
 
 # ── Benchmark: Concurrent TX/RX ────────────────────────────────────────────
 def bench_concurrent(args):
     """
     B2: Concurrent TX/RX throughput.
-    Generates CAMs while simultaneously receiving and decoding loopback packets.
+    Uses two separate stacks (different GN addresses) so the GN router's
+    Duplicate Address Detection doesn't drop loopback packets.
+    TX sends via BTP (synchronous to wire), RX receives on a separate stack.
     """
-    (
-        ca_svc,
-        link_layer,
-        loc_svc,
-        gn_router,
-        btp_router,
-        station_id,
-        rx_counter,
-    ) = build_stack(security_on=(args.security == "on"), interface=args.interface)
+    from flexstack.facilities.ca_basic_service.cam_coder import CAMCoder
+    from flexstack.geonet.service_access_point import (
+        PacketTransportType, HeaderType, TopoBroadcastHST,
+        CommunicationProfile, TrafficClass, CommonNH,
+    )
+    from flexstack.btp.service_access_point import BTPDataRequest, BTPDataIndication
+    from flexstack.security.security_profiles import SecurityProfile
 
-    ca_svc.start()
+    security_on = args.security == "on"
+
+    # ── TX stack ─────────────────────────────────────────────────────────
+    (
+        tx_ca_svc,
+        tx_link_layer,
+        tx_loc_svc,
+        tx_gn_router,
+        tx_btp_router,
+        tx_station_id,
+        _,
+    ) = build_stack(security_on=security_on, interface=args.interface)
+
+    # ── RX stack (minimal: LinkLayer → GN → BTP with direct callback) ──
+    rx_mac = generate_random_mac()
+    rx_gn_addr = GNAddress(m=M.GN_MULTICAST, st=ST.PASSENGER_CAR, mid=MID(rx_mac))
+
+    if security_on:
+        rx_sign_svc, rx_verify_svc = setup_security(at_index=2)
+        try:
+            from flexstack.geonet.mib import GnSecurity
+            rx_mib = MIB(itsGnLocalGnAddr=rx_gn_addr, itsGnSecurity=GnSecurity.ENABLED)
+        except ImportError:
+            rx_mib = MIB(itsGnLocalGnAddr=rx_gn_addr)
+        rx_gn_router = GNRouter(
+            mib=rx_mib,
+            sign_service=rx_sign_svc,
+            verify_service=rx_verify_svc,
+        )
+    else:
+        rx_mib = MIB(itsGnLocalGnAddr=rx_gn_addr)
+        rx_gn_router = GNRouter(mib=rx_mib, sign_service=None)
+
+    rx_btp_router = BTPRouter(rx_gn_router)
+    rx_gn_router.register_indication_callback(rx_btp_router.btp_data_indication)
+
+    rx_counter = {"count": 0}
+    rx_lock = threading.Lock()
+    coder_rx = CAMCoder()
+
+    def rx_btp_callback(indication: BTPDataIndication):
+        try:
+            coder_rx.decode(indication.data)
+            with rx_lock:
+                rx_counter["count"] += 1
+        except Exception:
+            pass
+
+    rx_btp_router.register_indication_callback_btp(2001, rx_btp_callback)
+    rx_btp_router.freeze_callbacks()
+
+    rx_link_layer = RawLinkLayer(
+        args.interface,
+        rx_mac,
+        receive_callback=rx_gn_router.gn_data_indicate,
+    )
+    rx_gn_router.link_layer = rx_link_layer
+
+    # ── CAM encoding ─────────────────────────────────────────────────────
+    coder = CAMCoder()
+    cam_value = _make_cam_value(tx_station_id)
+    encoded_cam = coder.encode(cam_value)
+
+    def make_btp_request(data):
+        return BTPDataRequest(
+            btp_type=CommonNH.BTP_B,
+            source_port=0,
+            destination_port=2001,
+            destination_port_info=0,
+            gn_packet_transport_type=PacketTransportType(
+                header_type=HeaderType.TSB,
+                header_subtype=TopoBroadcastHST.SINGLE_HOP,
+            ),
+            communication_profile=CommunicationProfile.UNSPECIFIED,
+            traffic_class=TrafficClass(scf=False, channel_offload=False, tc_id=0),
+            security_profile=(
+                SecurityProfile.COOPERATIVE_AWARENESS_MESSAGE
+                if security_on
+                else SecurityProfile.NO_SECURITY
+            ),
+            its_aid=36,
+            security_permissions=b"",
+            gn_max_hop_limit=1,
+            length=len(data),
+            data=data,
+        )
 
     # Warm-up
     print(f"  Warm-up phase ({args.warmup}s)...")
-    time.sleep(args.warmup)
+    warmup_end = time.monotonic_ns() + args.warmup * 10**9
+    while time.monotonic_ns() < warmup_end:
+        tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
     rx_counter["count"] = 0  # Reset after warm-up
 
-    # Measurement
+    # Measurement — TX is synchronous to wire
     print(f"  Measurement phase ({args.duration}s)...")
-    latencies = []
     t_start = time.monotonic_ns()
     deadline = t_start + args.duration * 10**9
-
-    cam_mgmt = ca_svc.cam_transmission_management
     tx_count = 0
 
     while time.monotonic_ns() < deadline:
-        t0 = time.monotonic_ns()
-        cam_mgmt.location_service_callback({
-            "latitude": POSITION_LAT + random.uniform(-0.0001, 0.0001),
-            "longitude": POSITION_LON + random.uniform(-0.0001, 0.0001),
-            "altitude": 120.0,
-            "speed": random.uniform(0, 30),
-            "heading": random.uniform(0, 360),
-        })
-        t1 = time.monotonic_ns()
-        latencies.append((t1 - t0) / 1000)
+        tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
         tx_count += 1
 
     t_end = time.monotonic_ns()
@@ -418,11 +556,15 @@ def bench_concurrent(args):
     throughput = tx_count / elapsed
     rx_total = rx_counter["count"]
 
-    print(f"  TX: {tx_count} CAMs ({throughput:.0f}/s), RX: {rx_total} CAMs")
+    print(f"  TX (wire): {tx_count} CAMs ({throughput:.0f}/s), RX: {rx_total} CAMs ({rx_total/elapsed:.0f}/s)")
 
-    teardown_stack(ca_svc, link_layer, loc_svc)
+    teardown_stack(tx_ca_svc, tx_link_layer, tx_loc_svc)
+    try:
+        rx_link_layer.sock.close()
+    except Exception:
+        pass
 
-    return compute_stats(args, "concurrent", tx_count, elapsed, throughput, latencies, [])
+    return compute_stats(args, "concurrent", tx_count, elapsed, throughput, [], [])
 
 
 # ── Benchmark: RX Throughput ────────────────────────────────────────────────
