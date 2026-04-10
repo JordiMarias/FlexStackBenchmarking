@@ -18,6 +18,12 @@ FlexStackBenchmarking/
 ├── scripts/
 │   ├── prepare_system.sh       # System preparation (CPU governor, etc.)
 │   └── run_benchmarks.sh       # Full orchestrator (all combinations)
+├── ansible/
+│   ├── inventory.yml           # Host inventory and benchmark variables
+│   ├── setup.yml               # Playbook: install dependencies
+│   ├── run.yml                 # Playbook: run benchmarks + fetch results
+│   └── tasks/
+│       └── run_cell.yml        # Included task: single benchmark cell
 ├── analysis/
 │   ├── analyze_results.py      # Statistical analysis + LaTeX tables
 │   ├── generate_plots.py       # Box plots, security comparison, CDF
@@ -92,6 +98,25 @@ sudo scripts/prepare_system.sh laptop
 
 # Run all benchmarks (3 impl × 2 security × 4 modes × 30 runs)
 sudo scripts/run_benchmarks.sh laptop 30 60
+```
+
+### 4b. Run via Ansible (remote hosts)
+
+```bash
+cd ansible
+
+# 1. Edit inventory.yml — add your hosts and tune benchmark parameters
+#    (bench_runs, bench_duration, bench_cores, bench_modes, etc.)
+
+# 2. Install dependencies on all hosts
+ansible-playbook -i inventory.yml setup.yml
+
+# 3. Run benchmarks and fetch results back to ./results/
+ansible-playbook -i inventory.yml run.yml
+
+# Selective setup (only install PyPy, or only Rust binary):
+ansible-playbook -i inventory.yml setup.yml --tags pypy
+ansible-playbook -i inventory.yml setup.yml --tags rust
 ```
 
 ### 5. Analyze Results

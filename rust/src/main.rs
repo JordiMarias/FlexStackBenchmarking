@@ -601,8 +601,6 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let coder = CamCoder::new();
     let template = make_cam(station_id);
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
     // Warm-up: feed packets to saturate the pipeline
     println!("  Warm-up phase ({}s)...", args.warmup);
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
@@ -612,29 +610,37 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
         }
     }
 
-    // Background feeder thread keeps the pipeline saturated during measurement
-    let btp_bg = btp_handle.clone();
-    let stop_clone = stop_flag.clone();
-    thread::spawn(move || {
-        let coder = CamCoder::new();
-        let template = make_cam(station_id);
-        while !stop_clone.load(Ordering::Relaxed) {
-            if let Ok(data) = coder.encode(&template) {
-                btp_bg.send_btp_data_request(cam_btp_request(data, security_on));
-            }
-        }
-    });
+    // Let pipeline drain after warmup
+    thread::sleep(Duration::from_millis(200));
 
-    // Measurement: snapshot wire counter at start and end
+    // Measurement: send packets sequentially, measure full-stack TX latency per packet
+    // (encode → BTP → GN → optional security sign → link layer)
     println!("  Measurement phase ({}s)...", args.duration);
+    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
     wire_counter.store(0, Ordering::SeqCst);
     let bench_start = Instant::now();
-    thread::sleep(Duration::from_secs(args.duration));
-    let total = wire_counter.load(Ordering::SeqCst);
-    let elapsed = bench_start.elapsed().as_secs_f64();
+    let bench_end = bench_start + Duration::from_secs(args.duration);
 
-    stop_flag.store(true, Ordering::Relaxed);
+    while Instant::now() < bench_end {
+        let prev = wire_counter.load(Ordering::SeqCst);
+        let t0 = Instant::now();
+        if let Ok(data) = coder.encode(&make_cam(station_id)) {
+            btp_handle.send_btp_data_request(cam_btp_request(data, security_on));
+            // Spin-wait until the packet hits the wire (full stack traversal)
+            while wire_counter.load(Ordering::Acquire) == prev {
+                std::hint::spin_loop();
+            }
+            let t1 = Instant::now();
+            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
+        }
+    }
+
+    let elapsed = bench_start.elapsed().as_secs_f64();
+    let total = latencies.len() as u64;
     let throughput = total as f64 / elapsed;
+
+    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
+        compute_stats(&mut latencies);
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -644,13 +650,13 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
         duration_s: elapsed,
         total_cams: total,
         throughput,
-        latency_mean: 0.0,
-        latency_std: 0.0,
-        latency_p50: 0.0,
-        latency_p95: 0.0,
-        latency_p99: 0.0,
-        latency_min: 0.0,
-        latency_max: 0.0,
+        latency_mean: lat_mean,
+        latency_std: lat_std,
+        latency_p50: lat_p50,
+        latency_p95: lat_p95,
+        latency_p99: lat_p99,
+        latency_min: lat_min,
+        latency_max: lat_max,
         sign_latency_mean: 0.0,
     }
 }
@@ -747,42 +753,52 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
         }
     }
 
-    // Background feeder thread keeps the pipeline saturated
-    let btp_bg = tx_btp.clone();
-    let stop_feed = Arc::new(AtomicBool::new(false));
-    let stop_feed_clone = stop_feed.clone();
-    thread::spawn(move || {
-        let coder = CamCoder::new();
-        let template = make_cam(station_id);
-        while !stop_feed_clone.load(Ordering::Relaxed) {
-            if let Ok(data) = coder.encode(&template) {
-                btp_bg.send_btp_data_request(cam_btp_request(data, security_on));
-            }
-        }
-    });
+    // Let pipeline drain after warmup
+    thread::sleep(Duration::from_millis(200));
 
-    // Reset counters, then snapshot during measurement
+    // Measurement: send packets sequentially, measure full end-to-end TX→RX latency
+    // (encode → TX BTP → TX GN → optional sign → TX LL → wire →
+    //  RX LL → optional verify → RX GN → RX BTP → decode)
+    println!("  Measurement phase ({}s)...", args.duration);
+    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
     wire_counter.store(0, Ordering::SeqCst);
     rx_count.store(0, Ordering::SeqCst);
     rx_errors.store(0, Ordering::SeqCst);
 
-    println!("  Measurement phase ({}s)...", args.duration);
     let bench_start = Instant::now();
-    thread::sleep(Duration::from_secs(args.duration));
+    let bench_end = bench_start + Duration::from_secs(args.duration);
+
+    while Instant::now() < bench_end {
+        let prev_rx = rx_count.load(Ordering::SeqCst);
+        let t0 = Instant::now();
+        if let Ok(data) = coder.encode(&make_cam(station_id)) {
+            tx_btp.send_btp_data_request(cam_btp_request(data, security_on));
+            // Wait for the packet to traverse the full TX→wire→RX pipeline
+            while rx_count.load(Ordering::Acquire) == prev_rx {
+                std::hint::spin_loop();
+            }
+            let t1 = Instant::now();
+            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
+        }
+    }
+
     let tx_total = wire_counter.load(Ordering::SeqCst);
     let rx_total = rx_count.load(Ordering::SeqCst);
     let elapsed = bench_start.elapsed().as_secs_f64();
 
-    stop_feed.store(true, Ordering::Relaxed);
     stop_flag.store(true, Ordering::Relaxed);
     thread::sleep(Duration::from_millis(200));
 
-    let throughput = tx_total as f64 / elapsed;
+    let total = latencies.len() as u64;
+    let throughput = total as f64 / elapsed;
 
     println!(
         "  TX (wire): {} CAMs ({:.0}/s), RX: {} CAMs ({:.0}/s)",
-        tx_total, throughput, rx_total, rx_total as f64 / elapsed
+        tx_total, tx_total as f64 / elapsed, rx_total, rx_total as f64 / elapsed
     );
+
+    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
+        compute_stats(&mut latencies);
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -790,15 +806,15 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
         security: args.security.clone(),
         benchmark: "concurrent".to_string(),
         duration_s: elapsed,
-        total_cams: tx_total,
+        total_cams: total,
         throughput,
-        latency_mean: 0.0,
-        latency_std: 0.0,
-        latency_p50: 0.0,
-        latency_p95: 0.0,
-        latency_p99: 0.0,
-        latency_min: 0.0,
-        latency_max: 0.0,
+        latency_mean: lat_mean,
+        latency_std: lat_std,
+        latency_p50: lat_p50,
+        latency_p95: lat_p95,
+        latency_p99: lat_p99,
+        latency_min: lat_min,
+        latency_max: lat_max,
         sign_latency_mean: 0.0,
     }
 }

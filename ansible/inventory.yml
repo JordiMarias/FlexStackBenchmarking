@@ -1,0 +1,95 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# FlexStack Benchmarking — Ansible Inventory
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Usage:
+#   ansible-playbook -i inventory.yml setup.yml
+#   ansible-playbook -i inventory.yml run.yml
+#
+# Each host MUST belong to exactly one platform group (laptop, rpi3, rpi5).
+# Group vars below configure benchmark parameters per platform.
+# ──────────────────────────────────────────────────────────────────────────────
+
+all:
+  vars:
+    # ── Project layout on remote hosts ──────────────────────────────────────
+    # Directory where benchmark files will be deployed on the remote host.
+    bench_dir: /home/{{ ansible_user }}/FlexStackBenchmarking
+
+    # ── PyPy version ────────────────────────────────────────────────────────
+    pypy_version: "pypy3.11-v7.3.21"
+
+    # ── Rust binary release ─────────────────────────────────────────────────
+    rust_release_tag: "v0.1.1"
+    rust_release_base: "https://github.com/JordiMarias/FlexStackBenchmarking/releases/download/{{ rust_release_tag }}"
+
+    # ── Benchmark parameters ────────────────────────────────────────────────
+    # Number of independent runs per benchmark cell.
+    bench_runs: 30
+
+    # Measurement duration in seconds per run.
+    bench_duration: 60
+
+    # Cool-down between runs in seconds.
+    bench_cooldown: 10
+
+    # Network interface for TX/RX/concurrent benchmarks.
+    bench_interface: lo
+
+    # CPU cores for taskset pinning (comma-separated).
+    bench_cores: "2,3"
+
+    # Benchmark modes to run. Comment out modes you want to skip.
+    bench_modes:
+      # B1: Full-stack TX throughput
+      - { mode: tx, security: "off", impl: [rust, cpython, pypy] }
+      - { mode: tx, security: "on",  impl: [rust, cpython, pypy] }
+      # B2: Full-stack RX throughput (receive-only, needs remote sender)
+      - { mode: rx, security: "off", impl: [rust, cpython, pypy] }
+      - { mode: rx, security: "on",  impl: [rust, cpython, pypy] }
+      # B3: Concurrent TX/RX
+      - { mode: concurrent, security: "off", impl: [rust, cpython, pypy] }
+      - { mode: concurrent, security: "on",  impl: [rust, cpython, pypy] }
+      # B4: ASN.1 Codec (no security, no networking)
+      - { mode: codec-encode,  security: "off", impl: [rust, cpython, pypy] }
+      - { mode: codec-decode,  security: "off", impl: [rust, cpython, pypy] }
+      # B5: Security Layer (in-memory sign/verify)
+      - { mode: security-sign,   security: "on", impl: [rust, cpython, pypy] }
+      - { mode: security-verify, security: "on", impl: [rust, cpython, pypy] }
+
+  children:
+    # ── Platform groups ─────────────────────────────────────────────────────
+    # Each group sets the platform tag used in CSV output and warm-up tuning.
+    laptop:
+      vars:
+        bench_platform: laptop
+        bench_warmup_cpython: 5
+        bench_warmup_pypy: 15
+        bench_warmup_rust: 5
+      hosts:
+        # laptop-1:
+        #   ansible_host: 192.168.1.100
+        #   ansible_user: user
+
+    rpi3:
+      vars:
+        bench_platform: rpi3
+        bench_warmup_cpython: 5
+        bench_warmup_pypy: 15
+        bench_warmup_rust: 5
+      hosts:
+        # rpi3-node1:
+        #   ansible_host: 192.168.1.10
+        #   ansible_user: pi
+
+    rpi5:
+      vars:
+        bench_platform: rpi5
+        bench_warmup_cpython: 5
+        bench_warmup_pypy: 15
+        bench_warmup_rust: 5
+      hosts:
+        # rpi5-node1:
+        #   ansible_host: 192.168.1.20
+        #   ansible_user: pi

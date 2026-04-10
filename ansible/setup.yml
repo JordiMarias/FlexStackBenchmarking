@@ -1,0 +1,220 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# FlexStack Benchmarking — Setup Playbook
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Installs all benchmark dependencies on remote hosts:
+#   1. Syncs project files (python/, scripts/, certs/ dirs)
+#   2. Creates a CPython venv and installs Python requirements
+#   3. Downloads and installs PyPy 3.11 with Python requirements
+#   4. Downloads pre-compiled Rust benchmark binary from GitHub Releases
+#   5. Generates ECDSA certificates for secured benchmarks
+#
+# Usage:
+#   ansible-playbook -i inventory.yml setup.yml
+#   ansible-playbook -i inventory.yml setup.yml --tags cpython    # only CPython
+#   ansible-playbook -i inventory.yml setup.yml --tags pypy       # only PyPy
+#   ansible-playbook -i inventory.yml setup.yml --tags rust       # only Rust binary
+#   ansible-playbook -i inventory.yml setup.yml --tags certs      # only certificates
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: Setup FlexStack Benchmarking environment
+  hosts: all
+  become: false
+
+  vars:
+    # Derived paths
+    project_src: "{{ playbook_dir }}/.."
+    venv_dir: "{{ bench_dir }}/venv"
+    pypy_dir: "{{ bench_dir }}/pypy"
+    rust_bin: "{{ bench_dir }}/rust/target/release/flexstack-bench"
+
+    # Architecture-dependent URLs
+    pypy_urls:
+      x86_64: "https://downloads.python.org/pypy/{{ pypy_version }}-linux64.tar.bz2"
+      aarch64: "https://downloads.python.org/pypy/{{ pypy_version }}-aarch64.tar.bz2"
+
+    rust_bin_urls:
+      x86_64: "{{ rust_release_base }}/flexstack-bench-x86_64-linux"
+      aarch64: "{{ rust_release_base }}/flexstack-bench-aarch64-linux"
+
+  tasks:
+    # ── Project files ──────────────────────────────────────────────────────
+    - name: Create benchmark directory structure
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop:
+        - "{{ bench_dir }}"
+        - "{{ bench_dir }}/python"
+        - "{{ bench_dir }}/scripts"
+        - "{{ bench_dir }}/certs"
+        - "{{ bench_dir }}/results"
+        - "{{ bench_dir }}/rust/target/release"
+      tags: [always]
+
+    - name: Sync Python benchmark files
+      copy:
+        src: "{{ project_src }}/python/"
+        dest: "{{ bench_dir }}/python/"
+        mode: "0644"
+      tags: [always]
+
+    - name: Sync orchestrator scripts
+      copy:
+        src: "{{ project_src }}/scripts/"
+        dest: "{{ bench_dir }}/scripts/"
+        mode: "0755"
+      tags: [always]
+
+    # ── CPython venv ───────────────────────────────────────────────────────
+    - name: Install python3-venv package (Debian/Ubuntu)
+      become: true
+      apt:
+        name:
+          - python3-venv
+          - python3-pip
+          - python3-setuptools
+        state: present
+        update_cache: true
+      when: ansible_os_family == "Debian"
+      tags: [cpython]
+
+    - name: Create CPython virtual environment
+      command:
+        cmd: python3 -m venv "{{ venv_dir }}"
+        creates: "{{ venv_dir }}/bin/python3"
+      tags: [cpython]
+
+    - name: Install Python requirements in CPython venv
+      pip:
+        requirements: "{{ bench_dir }}/python/requirements.txt"
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+      tags: [cpython]
+
+    # ── PyPy 3.11 ──────────────────────────────────────────────────────────
+    - name: Detect host architecture
+      set_fact:
+        host_arch: "{{ ansible_architecture }}"
+      tags: [pypy, rust]
+
+    - name: Set PyPy download URL for architecture
+      set_fact:
+        pypy_url: "{{ pypy_urls[host_arch] }}"
+      tags: [pypy]
+
+    - name: Determine PyPy archive filename
+      set_fact:
+        pypy_archive: "{{ pypy_url | basename }}"
+        pypy_extract_name: "{{ pypy_version }}-{{ 'linux64' if host_arch == 'x86_64' else 'aarch64' }}"
+      tags: [pypy]
+
+    - name: Download PyPy archive
+      command:
+        cmd: wget -q -O "/tmp/{{ pypy_archive }}" "{{ pypy_url }}"
+      args:
+        creates: "/tmp/{{ pypy_archive }}"
+      tags: [pypy]
+
+    - name: Remove old PyPy installation if present
+      file:
+        path: "{{ pypy_dir }}"
+        state: absent
+      tags: [pypy]
+
+    - name: Extract PyPy archive
+      unarchive:
+        src: "/tmp/{{ pypy_archive }}"
+        dest: "/tmp/"
+        remote_src: true
+      tags: [pypy]
+
+    - name: Move extracted PyPy to project directory
+      command:
+        cmd: mv "/tmp/{{ pypy_extract_name }}" "{{ pypy_dir }}"
+      tags: [pypy]
+
+    - name: Ensure PyPy ensurepip is available
+      command:
+        cmd: "{{ pypy_dir }}/bin/pypy3 -m ensurepip --upgrade"
+      changed_when: true
+      tags: [pypy]
+
+    - name: Install Python requirements in PyPy
+      command:
+        cmd: "{{ pypy_dir }}/bin/pypy3 -m pip install -r {{ bench_dir }}/python/requirements.txt"
+      changed_when: true
+      tags: [pypy]
+
+    - name: Clean up PyPy archive
+      file:
+        path: "/tmp/{{ pypy_archive }}"
+        state: absent
+      tags: [pypy]
+
+    # ── Rust binary ────────────────────────────────────────────────────────
+    - name: Set Rust binary download URL for architecture
+      set_fact:
+        rust_bin_url: "{{ rust_bin_urls[host_arch] }}"
+      tags: [rust]
+
+    - name: Download pre-compiled Rust benchmark binary
+      shell: >
+        wget -q -O "{{ rust_bin }}" "{{ rust_bin_url }}"
+        && chmod 755 "{{ rust_bin }}"
+      args:
+        executable: /bin/bash
+      changed_when: true
+      tags: [rust]
+
+    # ── Certificates ───────────────────────────────────────────────────────
+    - name: Generate ECDSA certificates for secured benchmarks
+      command:
+        cmd: "{{ venv_dir }}/bin/python3 {{ bench_dir }}/python/generate_certs.py"
+        chdir: "{{ bench_dir }}/python"
+      changed_when: true
+      tags: [certs]
+
+    # ── Verification ───────────────────────────────────────────────────────
+    - name: Verify CPython venv
+      command:
+        cmd: "{{ venv_dir }}/bin/python3 -c 'import flexstack; print(\"flexstack OK\")'"
+      register: cpython_check
+      changed_when: false
+      tags: [cpython, verify]
+
+    - name: Verify PyPy installation
+      command:
+        cmd: "{{ pypy_dir }}/bin/pypy3 -c 'import flexstack; print(\"flexstack OK\")'"
+      register: pypy_check
+      changed_when: false
+      tags: [pypy, verify]
+
+    - name: Verify Rust binary
+      command:
+        cmd: "{{ rust_bin }} --help"
+      register: rust_check
+      changed_when: false
+      tags: [rust, verify]
+
+    - name: Verify certificates exist
+      stat:
+        path: "{{ bench_dir }}/certs/root_ca.cert"
+      register: cert_check
+      tags: [certs, verify]
+
+    - name: Print setup summary
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          Setup complete on {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════
+            CPython : {{ cpython_check.stdout | default('NOT CHECKED') }}
+            PyPy    : {{ pypy_check.stdout | default('NOT CHECKED') }}
+            Rust    : {{ 'OK' if rust_check.rc == 0 else 'FAILED' }}
+            Certs   : {{ 'OK' if cert_check.stat.exists else 'MISSING' }}
+            Platform: {{ bench_platform }}
+          ═══════════════════════════════════════════════════════
+      tags: [always]

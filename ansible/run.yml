@@ -1,0 +1,80 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# FlexStack Benchmarking — Run Playbook
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Executes the full benchmark matrix on remote hosts and fetches results back
+# to the Ansible controller machine.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml run.yml
+#
+# What it does:
+#   1. Prepares the system (CPU governor, turbo boost, swap, etc.)
+#   2. Runs every benchmark cell defined in bench_modes (inventory.yml)
+#   3. Fetches the result CSV back to ./results/ on the controller
+#
+# The benchmark matrix is fully driven by the `bench_modes` variable in the
+# inventory. Comment out entries there to skip specific benchmark cells.
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: Run FlexStack Benchmarks
+  hosts: all
+  become: true
+
+  vars:
+    venv_dir: "{{ bench_dir }}/venv"
+    pypy_bin: "{{ bench_dir }}/pypy/bin/pypy3"
+    cpython_bin: "{{ venv_dir }}/bin/python3"
+    rust_bin: "{{ bench_dir }}/rust/target/release/flexstack-bench"
+    python_bench: "{{ bench_dir }}/python/benchmark.py"
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    results_csv: "{{ bench_dir }}/results/results_{{ bench_platform }}_{{ timestamp }}.csv"
+    local_results_dir: "{{ playbook_dir }}/../results"
+
+  tasks:
+    # ── System preparation ─────────────────────────────────────────────────
+    - name: Run system preparation script
+      command:
+        cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
+      changed_when: true
+      tags: [prepare]
+
+    # ── Run benchmarks ─────────────────────────────────────────────────────
+    - name: Run benchmark matrix
+      include_tasks: tasks/run_cell.yml
+      loop: "{{ bench_modes | subelements('impl') }}"
+      loop_control:
+        loop_var: bench_cell
+        label: "{{ bench_cell.1 }} | {{ bench_cell.0.mode }} | security={{ bench_cell.0.security }}"
+      tags: [bench]
+
+    # ── Fetch results ──────────────────────────────────────────────────────
+    - name: Ensure local results directory exists
+      become: false
+      delegate_to: localhost
+      file:
+        path: "{{ local_results_dir }}"
+        state: directory
+        mode: "0755"
+      run_once: true
+      tags: [fetch]
+
+    - name: Fetch results CSV to controller
+      fetch:
+        src: "{{ results_csv }}"
+        dest: "{{ local_results_dir }}/results_{{ bench_platform }}_{{ inventory_hostname }}_{{ timestamp }}.csv"
+        flat: true
+      tags: [fetch]
+
+    - name: Print completion summary
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          Benchmarks complete on {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════
+            Platform : {{ bench_platform }}
+            Results  : {{ results_csv }}
+            Fetched  : results/results_{{ bench_platform }}_{{ inventory_hostname }}_{{ timestamp }}.csv
+          ═══════════════════════════════════════════════════════
+      tags: [always]

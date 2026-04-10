@@ -1,0 +1,70 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# Run a single benchmark cell (implementation × mode × security) for N runs.
+#
+# Expected variables from loop:
+#   bench_cell.0  — dict with keys: mode, security, impl (list)
+#   bench_cell.1  — the current implementation string (rust, cpython, pypy)
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: "Set cell variables"
+  set_fact:
+    cell_impl: "{{ bench_cell.1 }}"
+    cell_mode: "{{ bench_cell.0.mode }}"
+    cell_security: "{{ bench_cell.0.security }}"
+
+- name: "Determine warm-up for {{ cell_impl }}"
+  set_fact:
+    cell_warmup: >-
+      {%- if cell_impl == 'pypy' -%}{{ bench_warmup_pypy }}
+      {%- elif cell_impl == 'cpython' -%}{{ bench_warmup_cpython }}
+      {%- else -%}{{ bench_warmup_rust }}{%- endif -%}
+
+- name: "Run {{ cell_impl }} | {{ cell_mode }} | security={{ cell_security }} ({{ bench_runs }} runs)"
+  shell: |
+    set -e
+    for RUN in $(seq 1 {{ bench_runs }}); do
+      echo "[$(date '+%H:%M:%S')] {{ cell_impl }} | {{ cell_mode }} | {{ cell_security }} | run $RUN/{{ bench_runs }}"
+
+      {% if cell_impl == 'rust' %}
+      chrt -f 50 taskset -c {{ bench_cores }} \
+        {{ rust_bin }} \
+        --mode {{ cell_mode }} --security {{ cell_security }} \
+        --duration {{ bench_duration }} --warmup {{ cell_warmup }} \
+        --output {{ results_csv }} --run-id $RUN \
+        --platform {{ bench_platform }} \
+        --interface {{ bench_interface }}
+      {% elif cell_impl == 'cpython' %}
+      chrt -f 50 taskset -c {{ bench_cores }} \
+        {{ cpython_bin }} {{ python_bench }} \
+        --mode {{ cell_mode }} --security {{ cell_security }} \
+        --duration {{ bench_duration }} --warmup {{ cell_warmup }} \
+        --output {{ results_csv }} --run-id $RUN \
+        --platform {{ bench_platform }} \
+        --interface {{ bench_interface }}
+      {% elif cell_impl == 'pypy' %}
+      chrt -f 50 taskset -c {{ bench_cores }} \
+        {{ pypy_bin }} {{ python_bench }} \
+        --mode {{ cell_mode }} --security {{ cell_security }} \
+        --duration {{ bench_duration }} --warmup {{ cell_warmup }} \
+        --output {{ results_csv }} --run-id $RUN \
+        --platform {{ bench_platform }} \
+        --interface {{ bench_interface }}
+      {% endif %}
+
+      # Cool-down between runs (skip after last run)
+      if [ "$RUN" -lt {{ bench_runs }} ]; then
+        echo "  Cooling down ({{ bench_cooldown }}s)..."
+        sleep {{ bench_cooldown }}
+      fi
+    done
+  args:
+    executable: /bin/bash
+  changed_when: true
+  register: cell_result
+  timeout: "{{ (bench_runs * (bench_duration | int + cell_warmup | int + bench_cooldown | int) + 300) | int }}"
+
+- name: "Show output for {{ cell_impl }} | {{ cell_mode }} | security={{ cell_security }}"
+  debug:
+    msg: "{{ cell_result.stdout_lines[-5:] }}"
+  when: cell_result.stdout_lines | length > 0
