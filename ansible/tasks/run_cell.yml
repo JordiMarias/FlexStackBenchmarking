@@ -62,7 +62,7 @@
     executable: /bin/bash
   changed_when: true
   register: cell_result
-  timeout: "{{ (bench_runs * (bench_duration | int + cell_warmup | int + bench_cooldown | int) + 300) | int }}"
+  timeout: "{{ (bench_runs * (bench_duration | int + cell_warmup | int + bench_cooldown | int + bench_run_overhead | int) + 300) | int }}"
 
 - name: "Show output for {{ cell_impl }} | {{ cell_mode }} | security={{ cell_security }}"
   debug:
