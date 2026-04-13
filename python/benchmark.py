@@ -484,14 +484,14 @@ def bench_concurrent(args):
     rx_gn_router.register_indication_callback(rx_btp_router.btp_data_indication)
 
     rx_counter = {"count": 0}
-    rx_lock = threading.Lock()
+    rx_event = threading.Event()
     coder_rx = CAMCoder()
 
     def rx_btp_callback(indication: BTPDataIndication):
         try:
             coder_rx.decode(indication.data)
-            with rx_lock:
-                rx_counter["count"] += 1
+            rx_counter["count"] += 1
+            rx_event.set()
         except Exception:
             pass
 
@@ -540,23 +540,30 @@ def bench_concurrent(args):
     while time.monotonic_ns() < warmup_end:
         tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
     rx_counter["count"] = 0  # Reset after warm-up
+    time.sleep(0.2)  # Let pipeline drain
 
-    # Measurement — TX is synchronous to wire
+    # Measurement — send sequentially, wait for RX callback per packet
+    # Measures full end-to-end latency: TX BTP → TX GN → sign → wire → RX LL → verify → RX GN → RX BTP → decode
     print(f"  Measurement phase ({args.duration}s)...")
+    latencies = []
     t_start = time.monotonic_ns()
     deadline = t_start + args.duration * 10**9
-    tx_count = 0
 
     while time.monotonic_ns() < deadline:
+        rx_event.clear()
+        t0 = time.monotonic_ns()
         tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
-        tx_count += 1
+        rx_event.wait(timeout=5.0)  # Wait for RX callback (full stack traversal)
+        t1 = time.monotonic_ns()
+        latencies.append((t1 - t0) / 1000)  # μs
 
     t_end = time.monotonic_ns()
     elapsed = (t_end - t_start) / 1e9
+    tx_count = len(latencies)
     throughput = tx_count / elapsed
     rx_total = rx_counter["count"]
 
-    print(f"  TX (wire): {tx_count} CAMs ({throughput:.0f}/s), RX: {rx_total} CAMs ({rx_total/elapsed:.0f}/s)")
+    print(f"  TX→RX: {tx_count} CAMs ({throughput:.0f}/s), RX total: {rx_total} ({rx_total/elapsed:.0f}/s)")
 
     teardown_stack(tx_ca_svc, tx_link_layer, tx_loc_svc)
     try:
@@ -564,7 +571,7 @@ def bench_concurrent(args):
     except Exception:
         pass
 
-    return compute_stats(args, "concurrent", tx_count, elapsed, throughput, [], [])
+    return compute_stats(args, "concurrent", tx_count, elapsed, throughput, latencies, [])
 
 
 # ── Benchmark: RX Throughput ────────────────────────────────────────────────

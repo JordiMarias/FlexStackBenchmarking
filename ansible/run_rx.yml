@@ -1,0 +1,315 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# FlexStack Benchmarking — RX Benchmark Playbook (Cross-Machine)
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Runs B2 (Full-Stack RX Throughput) benchmarks across two machines:
+#   - SENDER: floods CAMs at max rate using the Rust TX benchmark
+#   - RECEIVER: runs the RX benchmarks across all implementations
+#
+# Role assignment:
+#   - If one node is a laptop and the other is an RPi → RPi receives (DUT),
+#     laptop sends (traffic generator)
+#   - If both are laptops → the first host (alphabetically) sends,
+#     the second receives
+#   - If both are RPis → the more powerful one sends (rpi5 > rpi3),
+#     or first alphabetically if same platform
+#
+# Requirements:
+#   - Exactly 2 hosts must be targeted (use --limit)
+#   - Both hosts must share a common L2 interface (set rx_interface)
+#   - setup.yml must have been run on both hosts
+#
+# Usage:
+#   # Set the L2 interface connecting both machines:
+#   ansible-playbook -i inventory.yml run_rx.yml \
+#     --limit "rpi5-node1,laptop-1" \
+#     -e rx_interface=eth0
+#
+#   # Or with security=on sender:
+#   ansible-playbook -i inventory.yml run_rx.yml \
+#     --limit "rpi5-node1,laptop-1" \
+#     -e rx_interface=eth0 -e rx_security=on
+#
+# Monitor progress:
+#   ssh pi@<receiver> tail -f ~/FlexStackBenchmarking/results/bench_rx.log
+#
+# Fetch results:
+#   ansible-playbook -i inventory.yml fetch_results.yml --limit <receiver>
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ════════════════════════════════════════════════════════════════════════════
+# Play 1: Gather facts and assign roles (runs on all targeted hosts)
+# ════════════════════════════════════════════════════════════════════════════
+- name: "RX Benchmark — Assign sender/receiver roles"
+  hosts: all
+  gather_facts: true
+
+  vars:
+    rx_interface: "{{ rx_interface | default('eth0') }}"
+
+  tasks:
+    - name: Validate exactly 2 hosts targeted
+      assert:
+        that:
+          - ansible_play_hosts | length == 2
+        fail_msg: >
+          Exactly 2 hosts are required for RX benchmarks.
+          Use --limit to select a sender and a receiver.
+          Got: {{ ansible_play_hosts | join(', ') }}
+      run_once: true
+
+    - name: Assign platform power ranking
+      set_fact:
+        # laptop=3 (most powerful), rpi5=2, rpi3=1
+        platform_rank: >-
+          {%- if bench_platform == 'laptop' -%}3
+          {%- elif bench_platform == 'rpi5' -%}2
+          {%- else -%}1{%- endif -%}
+
+    - name: Determine roles across all hosts
+      set_fact:
+        # Build a list of (hostname, rank) pairs, sorted.
+        # The host with the HIGHER rank is the sender (more powerful).
+        # The host with the LOWER rank is the receiver (DUT).
+        # On equal rank, first alphabetically sends.
+        rx_role: >-
+          {%- set hosts_ranked = [] -%}
+          {%- for h in ansible_play_hosts -%}
+            {%- set rank = hostvars[h].platform_rank | int -%}
+            {%- set _ = hosts_ranked.append({'name': h, 'rank': rank}) -%}
+          {%- endfor -%}
+          {%- set sorted_hosts = hosts_ranked | sort(attribute='rank') | reverse | list -%}
+          {%- if inventory_hostname == sorted_hosts[0].name -%}sender
+          {%- else -%}receiver{%- endif -%}
+
+    - name: Display role assignments
+      debug:
+        msg: "{{ inventory_hostname }} ({{ bench_platform }}) → {{ rx_role }}"
+
+# ════════════════════════════════════════════════════════════════════════════
+# Play 2: Launch the SENDER (traffic generator)
+# ════════════════════════════════════════════════════════════════════════════
+- name: "RX Benchmark — Launch sender"
+  hosts: all
+  become: true
+
+  vars:
+    rx_interface: "{{ rx_interface | default('eth0') }}"
+    # Send for long enough to cover all receiver runs.
+    # 6 cells (3 impls × 2 security) × 30 runs × (60s + 15s warmup + 10s cooldown) + 1h buffer
+    rx_send_duration: "{{ ((6 * bench_runs | int * (bench_duration | int + 15 + bench_cooldown | int)) + 3600) | int }}"
+    rust_bin: "{{ bench_dir }}/rust/target/release/flexstack-bench"
+    sender_log: "{{ bench_dir }}/results/bench_rx_sender.log"
+    sender_pidfile: "{{ bench_dir }}/results/bench_rx_sender.pid"
+
+  tasks:
+    - name: Skip if not sender
+      meta: end_host
+      when: rx_role != 'sender'
+
+    - name: Prepare system on sender
+      command:
+        cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
+      changed_when: true
+
+    - name: Kill any existing sender process
+      shell: |
+        if [ -f {{ sender_pidfile }} ] && kill -0 $(cat {{ sender_pidfile }}) 2>/dev/null; then
+          kill $(cat {{ sender_pidfile }}) || true
+          sleep 2
+        fi
+        rm -f {{ sender_pidfile }}
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Ensure results directory exists
+      file:
+        path: "{{ bench_dir }}/results"
+        state: directory
+        mode: "0755"
+
+    - name: Generate sender script
+      copy:
+        dest: "{{ bench_dir }}/results/rx_sender.sh"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          echo $$ > {{ sender_pidfile }}
+          echo "============================================================"
+          echo "RX Benchmark — Sender on {{ inventory_hostname }}"
+          echo "Interface: {{ rx_interface }}"
+          echo "Duration : {{ rx_send_duration }}s"
+          echo "Security : off (unsecured packets)"
+          echo "Started  : $(date)"
+          echo "============================================================"
+
+          # Send unsecured packets first (receiver runs security=off first)
+          echo "[$(date '+%H:%M:%S')] Sending unsecured CAMs..."
+          {{ rust_bin }} \
+            --mode tx --security off \
+            --duration {{ rx_send_duration }} --warmup 0 \
+            --interface {{ rx_interface }} \
+            --output /dev/null --platform {{ bench_platform }} --run-id 1 \
+            || echo "[WARN] Sender exited with error"
+
+          echo "[$(date '+%H:%M:%S')] Sender finished"
+          rm -f {{ sender_pidfile }}
+
+    - name: Launch sender in background
+      shell: |
+        nohup bash {{ bench_dir }}/results/rx_sender.sh </dev/null >{{ sender_log }} 2>&1 &
+        echo $!
+      args:
+        executable: /bin/bash
+      register: sender_launch
+      changed_when: true
+
+    - name: Sender launched
+      debug:
+        msg: |
+          Sender started on {{ inventory_hostname }} (PID {{ sender_launch.stdout }})
+          Interface: {{ rx_interface }}
+          Duration : {{ rx_send_duration }}s
+          Log      : {{ sender_log }}
+
+# ════════════════════════════════════════════════════════════════════════════
+# Play 3: Launch the RECEIVER (RX benchmarks)
+# ════════════════════════════════════════════════════════════════════════════
+- name: "RX Benchmark — Launch receiver"
+  hosts: all
+  become: true
+
+  vars:
+    rx_interface: "{{ rx_interface | default('eth0') }}"
+    venv_dir: "{{ bench_dir }}/venv"
+    pypy_bin: "{{ bench_dir }}/pypy/bin/pypy3"
+    cpython_bin: "{{ venv_dir }}/bin/python3"
+    rust_bin: "{{ bench_dir }}/rust/target/release/flexstack-bench"
+    python_bench: "{{ bench_dir }}/python/benchmark.py"
+    timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+    results_csv: "{{ bench_dir }}/results/results_rx_{{ bench_platform }}_{{ timestamp }}.csv"
+    run_log: "{{ bench_dir }}/results/bench_rx.log"
+    run_pidfile: "{{ bench_dir }}/results/bench_rx.pid"
+
+    # RX modes to benchmark
+    rx_modes:
+      - { security: "off", impl: [rust, cpython, pypy] }
+      - { security: "on",  impl: [rust, cpython, pypy] }
+
+  tasks:
+    - name: Skip if not receiver
+      meta: end_host
+      when: rx_role != 'receiver'
+
+    - name: Prepare system on receiver
+      command:
+        cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
+      changed_when: true
+
+    # Give sender 5 seconds to start flooding
+    - name: Wait for sender to start
+      pause:
+        seconds: 5
+
+    - name: Ensure results directory exists
+      file:
+        path: "{{ bench_dir }}/results"
+        state: directory
+        mode: "0755"
+
+    - name: Generate receiver benchmark script
+      copy:
+        dest: "{{ bench_dir }}/results/rx_receiver.sh"
+        mode: "0755"
+        content: |
+          #!/bin/bash
+          set -euo pipefail
+          echo $$ > {{ run_pidfile }}
+          exec > >(tee -a {{ run_log }}) 2>&1
+
+          echo "============================================================"
+          echo "RX Benchmark — Receiver on {{ inventory_hostname }} ({{ bench_platform }})"
+          echo "Interface: {{ rx_interface }}"
+          echo "Started  : $(date)"
+          echo "Results  : {{ results_csv }}"
+          echo "============================================================"
+
+          {% for cell in rx_modes %}
+          {% for impl in cell.impl %}
+          {% set warmup = bench_warmup_pypy if impl == 'pypy' else (bench_warmup_cpython if impl == 'cpython' else bench_warmup_rust) %}
+          echo ""
+          echo "================================================================"
+          echo "  {{ impl }} | rx | security={{ cell.security }}"
+          echo "================================================================"
+          for RUN in $(seq 1 {{ bench_runs }}); do
+            echo "[$(date '+%H:%M:%S')] {{ impl }} | rx | {{ cell.security }} | run $RUN/{{ bench_runs }}"
+          {% if impl == 'rust' %}
+            chrt -f 50 taskset -c {{ bench_cores }} \
+              {{ rust_bin }} \
+              --mode rx --security {{ cell.security }} \
+              --duration {{ bench_duration }} --warmup {{ warmup }} \
+              --output {{ results_csv }} --run-id $RUN \
+              --platform {{ bench_platform }} \
+              --interface {{ rx_interface }} || echo "  [WARN] exited with error"
+          {% elif impl == 'cpython' %}
+            chrt -f 50 taskset -c {{ bench_cores }} \
+              {{ cpython_bin }} {{ python_bench }} \
+              --mode rx --security {{ cell.security }} \
+              --duration {{ bench_duration }} --warmup {{ warmup }} \
+              --output {{ results_csv }} --run-id $RUN \
+              --platform {{ bench_platform }} \
+              --interface {{ rx_interface }} || echo "  [WARN] exited with error"
+          {% elif impl == 'pypy' %}
+            chrt -f 50 taskset -c {{ bench_cores }} \
+              {{ pypy_bin }} {{ python_bench }} \
+              --mode rx --security {{ cell.security }} \
+              --duration {{ bench_duration }} --warmup {{ warmup }} \
+              --output {{ results_csv }} --run-id $RUN \
+              --platform {{ bench_platform }} \
+              --interface {{ rx_interface }} || echo "  [WARN] exited with error"
+          {% endif %}
+            if [ "$RUN" -lt {{ bench_runs }} ]; then
+              echo "  Cooling down ({{ bench_cooldown }}s)..."
+              sleep {{ bench_cooldown }}
+            fi
+          done
+
+          {% endfor %}
+          {% endfor %}
+          echo ""
+          echo "============================================================"
+          echo "RX benchmarks complete: $(date)"
+          echo "Results: {{ results_csv }}"
+          echo "============================================================"
+          rm -f {{ run_pidfile }}
+
+    - name: Launch receiver benchmarks in background
+      shell: |
+        nohup bash {{ bench_dir }}/results/rx_receiver.sh </dev/null >{{ run_log }} 2>&1 &
+        echo $!
+      args:
+        executable: /bin/bash
+      register: receiver_launch
+      changed_when: true
+
+    - name: Receiver launched
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          RX Benchmarks launched on {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════
+            PID       : {{ receiver_launch.stdout }}
+            Platform  : {{ bench_platform }}
+            Interface : {{ rx_interface }}
+            Log       : {{ run_log }}
+            Results   : {{ results_csv }}
+
+            Monitor progress:
+              ssh {{ ansible_user }}@{{ ansible_host }} tail -f {{ run_log }}
+
+            Fetch results when done:
+              ansible-playbook -i inventory.yml fetch_results.yml --limit {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════

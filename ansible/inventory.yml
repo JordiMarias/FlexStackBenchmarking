@@ -21,7 +21,7 @@ all:
     pypy_version: "pypy3.11-v7.3.21"
 
     # ── Rust binary release ─────────────────────────────────────────────────
-    rust_release_tag: "v0.1.1"
+    rust_release_tag: "v0.1.2"
     rust_release_base: "https://github.com/JordiMarias/FlexStackBenchmarking/releases/download/{{ rust_release_tag }}"
 
     # ── Benchmark parameters ────────────────────────────────────────────────
@@ -40,14 +40,18 @@ all:
     # CPU cores for taskset pinning (comma-separated).
     bench_cores: "2,3"
 
+    # Per-run overhead budget in seconds (Python startup, stack init, cert gen).
+    # Increase for slower platforms.
+    bench_run_overhead: 30
+
     # Benchmark modes to run. Comment out modes you want to skip.
     bench_modes:
       # B1: Full-stack TX throughput
       - { mode: tx, security: "off", impl: [rust, cpython, pypy] }
       - { mode: tx, security: "on",  impl: [rust, cpython, pypy] }
-      # B2: Full-stack RX throughput (receive-only, needs remote sender)
-      - { mode: rx, security: "off", impl: [rust, cpython, pypy] }
-      - { mode: rx, security: "on",  impl: [rust, cpython, pypy] }
+      # B2: Full-stack RX throughput — use run_rx.yml instead (cross-machine)
+      # - { mode: rx, security: "off", impl: [rust, cpython, pypy] }
+      # - { mode: rx, security: "on",  impl: [rust, cpython, pypy] }
       # B3: Concurrent TX/RX
       - { mode: concurrent, security: "off", impl: [rust, cpython, pypy] }
       - { mode: concurrent, security: "on",  impl: [rust, cpython, pypy] }
@@ -78,10 +82,14 @@ all:
         bench_warmup_cpython: 5
         bench_warmup_pypy: 15
         bench_warmup_rust: 5
+        bench_run_overhead: 60
       hosts:
-        # rpi3-node1:
-        #   ansible_host: 192.168.1.10
-        #   ansible_user: pi
+        rpi3-node1:
+          ansible_host: 192.168.0.103
+          ansible_user: pi
+        rpi3-node2:
+          ansible_host: 192.168.0.101
+          ansible_user: pi
 
     rpi5:
       vars:
@@ -90,6 +98,6 @@ all:
         bench_warmup_pypy: 15
         bench_warmup_rust: 5
       hosts:
-        # rpi5-node1:
-        #   ansible_host: 192.168.1.20
-        #   ansible_user: pi
+        rpi5-node1:
+          ansible_host: 192.168.0.102
+          ansible_user: pi

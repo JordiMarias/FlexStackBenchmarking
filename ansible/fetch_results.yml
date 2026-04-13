@@ -1,0 +1,98 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# FlexStack Benchmarking — Fetch Results Playbook
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Connects to remote hosts and downloads all result CSV files back to the
+# controller machine. Also reports whether benchmarks are still running.
+#
+# Usage:
+#   ansible-playbook -i inventory.yml fetch_results.yml
+# ──────────────────────────────────────────────────────────────────────────────
+
+- name: Fetch Benchmark Results
+  hosts: all
+  become: false
+
+  vars:
+    local_results_dir: "{{ playbook_dir }}/../results"
+    run_pidfile: "{{ bench_dir }}/results/bench_run.pid"
+    run_log: "{{ bench_dir }}/results/bench_run.log"
+
+  tasks:
+    # ── Check benchmark status ─────────────────────────────────────────────
+    - name: Check if benchmarks are still running
+      shell: |
+        if [ -f {{ run_pidfile }} ] && kill -0 $(cat {{ run_pidfile }}) 2>/dev/null; then
+          echo "RUNNING (PID $(cat {{ run_pidfile }}))"
+        else
+          echo "FINISHED"
+        fi
+      args:
+        executable: /bin/bash
+      register: bench_status
+      changed_when: false
+
+    - name: Show benchmark status
+      debug:
+        msg: "{{ inventory_hostname }}: {{ bench_status.stdout }}"
+
+    - name: Show last log lines (if still running)
+      shell: tail -5 {{ run_log }} 2>/dev/null || echo "(no log found)"
+      args:
+        executable: /bin/bash
+      register: log_tail
+      changed_when: false
+      when: "'RUNNING' in bench_status.stdout"
+
+    - name: Display log tail
+      debug:
+        msg: "{{ log_tail.stdout_lines }}"
+      when: "'RUNNING' in bench_status.stdout"
+
+    # ── Find and fetch result files ────────────────────────────────────────
+    - name: Find result CSV files on remote host
+      find:
+        paths: "{{ bench_dir }}/results"
+        patterns: "results_*.csv"
+      register: result_files
+
+    - name: Show found files
+      debug:
+        msg: "Found {{ result_files.files | length }} result file(s) on {{ inventory_hostname }}"
+
+    - name: Ensure local results directory exists
+      delegate_to: localhost
+      file:
+        path: "{{ local_results_dir }}"
+        state: directory
+        mode: "0755"
+      run_once: true
+
+    - name: Fetch all result CSVs to controller
+      fetch:
+        src: "{{ item.path }}"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_{{ item.path | basename }}"
+        flat: true
+      loop: "{{ result_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+
+    # ── Also fetch the log ─────────────────────────────────────────────────
+    - name: Fetch benchmark log
+      fetch:
+        src: "{{ run_log }}"
+        dest: "{{ local_results_dir }}/{{ inventory_hostname }}_bench_run.log"
+        flat: true
+      ignore_errors: true
+
+    - name: Print fetch summary
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════════════
+          Fetched from {{ inventory_hostname }}
+          ═══════════════════════════════════════════════════════
+            Status : {{ bench_status.stdout }}
+            Files  : {{ result_files.files | map(attribute='path') | map('basename') | list | join(', ') }}
+            Saved to: {{ local_results_dir }}/
+          ═══════════════════════════════════════════════════════
