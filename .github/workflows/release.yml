@@ -1,4 +1,4 @@
-name: Release Rust Binaries
+name: Release
 
 on:
   push:
@@ -8,8 +8,12 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
+    name: Build portable binary (${{ matrix.target }})
     strategy:
       matrix:
         include:
@@ -28,13 +32,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install cargo-zigbuild
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install ziglang
+          cargo install cargo-zigbuild --locked
 
-      - name: Install cross (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Install ELF inspection tools
+        run: sudo apt-get update && sudo apt-get install -y binutils
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -42,19 +47,31 @@ jobs:
           workspaces: rust
           key: ${{ matrix.target }}
 
-      - name: Build release binary (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-musl'
+      - name: Build release binary (musl static)
         working-directory: rust
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
 
-      - name: Build release binary (aarch64 via cross)
-        if: matrix.target == 'aarch64-unknown-linux-musl'
-        working-directory: rust
-        env:
-          RUSTFLAGS: "-C target-feature=+crt-static"
-        run: cross build --release --target ${{ matrix.target }}
+      - name: Verify binary is truly portable (static, no dynamic loader)
+        run: |
+          BIN="rust/target/${{ matrix.target }}/release/flexstack-bench"
+
+          file "$BIN"
+
+          # Static binary must not have DT_NEEDED entries.
+          if readelf -d "$BIN" | grep -q '(NEEDED)'; then
+            echo "Binary is dynamically linked (DT_NEEDED found), aborting."
+            exit 1
+          fi
+
+          # Static binary must not request a runtime ELF interpreter.
+          if readelf -l "$BIN" | grep -q 'Requesting program interpreter'; then
+            echo "Binary has a dynamic loader/interpreter, aborting."
+            exit 1
+          fi
+
+          echo "Binary passed static-link portability checks."
 
       - name: Rename binary
         run: cp rust/target/${{ matrix.target }}/release/flexstack-bench ${{ matrix.binary_name }}
@@ -66,6 +83,7 @@ jobs:
           path: ${{ matrix.binary_name }}
 
   release:
+    name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
 
@@ -82,8 +100,30 @@ jobs:
           cp artifacts/flexstack-bench-aarch64-linux/flexstack-bench-aarch64-linux release/
           chmod +x release/*
 
+      - name: Generate checksums
+        run: |
+          cd release
+          sha256sum flexstack-bench-x86_64-linux flexstack-bench-aarch64-linux > SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          append_body: true
           files: release/*
+          body: |
+            ## Included binaries
+
+            - `flexstack-bench-x86_64-linux`: Benchmark runner for Linux x86_64 hosts.
+            - `flexstack-bench-aarch64-linux`: Benchmark runner for Linux ARM64 hosts.
+
+            Both binaries are built as static musl executables for broad Linux portability.
+
+            ## Integrity verification
+
+            This release includes `SHA256SUMS`.
+            Verify downloads with:
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
