@@ -32,4 +32,7 @@ Thumbs.db
 
 # Environment (keep .env.example)
 .env
-next_steps2.md
+RustFlexstack/
+rust/cohda-toolchain/
+*.csv
+*.pdf

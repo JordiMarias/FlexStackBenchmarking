@@ -72,9 +72,10 @@ all:
         bench_warmup_pypy: 15
         bench_warmup_rust: 5
       hosts:
-        # laptop-1:
-        #   ansible_host: 192.168.1.100
-        #   ansible_user: user
+        laptop-1:
+          ansible_host: 172.27.9.198
+          ansible_user: v2xi2cat
+          ansible_become_password: v2X@i2cat!2025
 
     rpi3:
       vars:
@@ -84,12 +85,12 @@ all:
         bench_warmup_rust: 5
         bench_run_overhead: 60
       hosts:
-        rpi3-node1:
-          ansible_host: 192.168.0.103
-          ansible_user: pi
-        rpi3-node2:
-          ansible_host: 192.168.0.101
-          ansible_user: pi
+        # rpi3-node1:
+        #   ansible_host: 192.168.0.103
+        #   ansible_user: pi
+        # rpi3-node2:
+        #   ansible_host: 192.168.0.101
+        #   ansible_user: pi
 
     rpi5:
       vars:
@@ -99,5 +100,6 @@ all:
         bench_warmup_rust: 5
       hosts:
         rpi5-node1:
-          ansible_host: 192.168.0.102
-          ansible_user: pi
+          ansible_host: 192.168.59.50
+          ansible_user: v2xi2cat
+          ansible_become_password: v2X@i2cat!2022

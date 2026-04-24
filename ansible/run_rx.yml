@@ -17,19 +17,24 @@
 #
 # Requirements:
 #   - Exactly 2 hosts must be targeted (use --limit)
-#   - Both hosts must share a common L2 interface (set rx_interface)
+#   - Both hosts must share a common L2 link
 #   - setup.yml must have been run on both hosts
 #
 # Usage:
-#   # Set the L2 interface connecting both machines:
+#   # Same interface on both machines:
 #   ansible-playbook -i inventory.yml run_rx.yml \
 #     --limit "rpi5-node1,laptop-1" \
 #     -e rx_interface=eth0
 #
+#   # Different interfaces (sender=eno1, receiver=eth0):
+#   ansible-playbook -i inventory.yml run_rx.yml \
+#     --limit "rpi5-node1,laptop-1" \
+#     -e tx_interface=eno1 -e rx_interface=eth0
+#
 #   # Or with security=on sender:
 #   ansible-playbook -i inventory.yml run_rx.yml \
 #     --limit "rpi5-node1,laptop-1" \
-#     -e rx_interface=eth0 -e rx_security=on
+#     -e tx_interface=eno1 -e rx_interface=eth0 -e rx_security=on
 #
 # Monitor progress:
 #   ssh pi@<receiver> tail -f ~/FlexStackBenchmarking/results/bench_rx.log
@@ -95,7 +100,7 @@
   become: true
 
   vars:
-    rx_interface: "{{ rx_interface | default('eth0') }}"
+    tx_interface: "{{ tx_interface | default(rx_interface | default('eth0')) }}"
     # Send for long enough to cover all receiver runs.
     # 6 cells (3 impls × 2 security) × 30 runs × (60s + 15s warmup + 10s cooldown) + 1h buffer
     rx_send_duration: "{{ ((6 * bench_runs | int * (bench_duration | int + 15 + bench_cooldown | int)) + 3600) | int }}"
@@ -108,10 +113,10 @@
       meta: end_host
       when: rx_role != 'sender'
 
-    - name: Prepare system on sender
-      command:
-        cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
-      changed_when: true
+    # - name: Prepare system on sender
+    #   command:
+    #     cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
+    #   changed_when: true
 
     - name: Kill any existing sender process
       shell: |
@@ -140,7 +145,7 @@
           echo $$ > {{ sender_pidfile }}
           echo "============================================================"
           echo "RX Benchmark — Sender on {{ inventory_hostname }}"
-          echo "Interface: {{ rx_interface }}"
+          echo "Interface: {{ tx_interface }}"
           echo "Duration : {{ rx_send_duration }}s"
           echo "Security : off (unsecured packets)"
           echo "Started  : $(date)"
@@ -151,7 +156,7 @@
           {{ rust_bin }} \
             --mode tx --security off \
             --duration {{ rx_send_duration }} --warmup 0 \
-            --interface {{ rx_interface }} \
+            --interface {{ tx_interface }} \
             --output /dev/null --platform {{ bench_platform }} --run-id 1 \
             || echo "[WARN] Sender exited with error"
 
@@ -171,7 +176,7 @@
       debug:
         msg: |
           Sender started on {{ inventory_hostname }} (PID {{ sender_launch.stdout }})
-          Interface: {{ rx_interface }}
+          Interface: {{ tx_interface }}
           Duration : {{ rx_send_duration }}s
           Log      : {{ sender_log }}
 
@@ -204,10 +209,10 @@
       meta: end_host
       when: rx_role != 'receiver'
 
-    - name: Prepare system on receiver
-      command:
-        cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
-      changed_when: true
+    # - name: Prepare system on receiver
+    #   command:
+    #     cmd: bash {{ bench_dir }}/scripts/prepare_system.sh {{ bench_platform }}
+    #   changed_when: true
 
     # Give sender 5 seconds to start flooding
     - name: Wait for sender to start

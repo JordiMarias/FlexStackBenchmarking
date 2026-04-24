@@ -1,16 +1,25 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2024 Fundació Privada Internet i Innovació Digital a Catalunya (i2CAT)
 //!
-//! FlexStack Benchmark — Rust
+//! FlexStack Benchmark — Rust (C-V2X link layer)
 //!
-//! Benchmark harness for `rustflexstack` measuring:
-//!   B1  Full-stack TX throughput (loopback)
-//!   B2  Concurrent TX/RX throughput (loopback)
-//!   B3  ASN.1 codec encode/decode throughput (in-memory)
+//! Adaptation of the FlexStack benchmark harness for Cohda MK6 hardware
+//! using the C-V2X radio link layer instead of raw Ethernet.
 //!
-//! Usage:
-//!   sudo ./flexstack-bench --mode tx --security off --duration 60
-//!   sudo ./flexstack-bench --mode concurrent --security on --duration 60
+//! CAMs are transmitted via the SPS (Semi-Persistent Scheduling) flow.
+//! The C-V2X radio manages its own interface — no network interface argument
+//! is required.
+//!
+//! # Building (cross-compile for MK6)
+//! ```text
+//! cd cohda-toolchain && ./build-cv2x.sh --release --bin flexstack-bench-cv2x
+//! ```
+//!
+//! # Running (on MK6 device)
+//! ```text
+//! ./flexstack-bench-cv2x --mode tx --security off --duration 60
+//! ./flexstack-bench-cv2x --mode rx --security off --duration 60
+//! ```
 
 use clap::Parser;
 use std::fs::{self, OpenOptions};
@@ -45,7 +54,7 @@ use rustflexstack::geonet::service_access_point::{
     Area, CommonNH, CommunicationProfile, HeaderSubType,
     HeaderType, PacketTransportType, TopoBroadcastHST, TrafficClass,
 };
-use rustflexstack::link_layer::raw_link_layer::RawLinkLayer;
+use rustflexstack::link_layer::cv2x_link_layer::Cv2xLinkLayer;
 use rustflexstack::security::sn_sap::{ReportVerify, SNSignRequest, SNVerifyRequest, SecurityProfile};
 
 // Security imports
@@ -58,13 +67,13 @@ use rustflexstack::security::verify_service::{verify_message, VerifyEvent};
 // ── CLI ─────────────────────────────────────────────────────────────────────
 #[derive(Parser, Debug)]
 #[command(
-    name = "flexstack-bench",
-    about = "FlexStack Benchmark — Rust",
-    long_about = "Benchmark harness for RustFlexStack measuring TX/RX throughput and codec performance.\n\nModes:\n  tx              Send CAMs at max rate, measure wire throughput (also used as remote sender for rx)\n  rx              Receive-only: listen for CAMs from a remote sender and measure RX throughput\n  concurrent      Self-contained TX+RX on same machine (two stacks)\n  codec-encode    ASN.1 CAM encode throughput (in-memory)\n  codec-decode    ASN.1 CAM decode throughput (in-memory)\n  security-sign   ECDSA-P256 signing throughput (in-memory, no networking)\n  security-verify ECDSA-P256 verification throughput (in-memory, no networking)\n\nCross-machine RX example:\n  Machine A (sender):   sudo ./flexstack-bench --mode tx --interface eth0\n  Machine B (receiver): sudo ./flexstack-bench --mode rx --interface eth0"
+    name = "flexstack-bench-cv2x",
+    about = "FlexStack Benchmark — Rust (C-V2X link layer)",
+    long_about = "Benchmark harness for RustFlexStack on Cohda MK6 hardware using C-V2X radio.\n\nModes:\n  tx              Send CAMs at max rate over C-V2X, measure wire throughput\n  rx              Receive-only: listen for CAMs over C-V2X and measure RX throughput\n  codec-encode    ASN.1 CAM encode throughput (in-memory)\n  codec-decode    ASN.1 CAM decode throughput (in-memory)\n  security-sign   ECDSA-P256 signing throughput (in-memory)\n  security-verify ECDSA-P256 verification throughput (in-memory)\n\nCross-machine example:\n  Device A (sender):   ./flexstack-bench-cv2x --mode tx\n  Device B (receiver): ./flexstack-bench-cv2x --mode rx"
 )]
 struct Args {
     /// Benchmark mode
-    #[arg(long, value_parser = ["tx", "rx", "concurrent", "codec-encode", "codec-decode", "security-sign", "security-verify"])]
+    #[arg(long, value_parser = ["tx", "rx", "codec-encode", "codec-decode", "security-sign", "security-verify"])]
     mode: String,
 
     /// Security mode (ECDSA-P256 signing/verification)
@@ -88,12 +97,8 @@ struct Args {
     run_id: u32,
 
     /// Platform identifier for CSV output
-    #[arg(long, default_value = "laptop", value_parser = ["laptop", "rpi3", "rpi5"])]
+    #[arg(long, default_value = "mk6", value_parser = ["mk6", "mk6c", "mk6-ag550"])]
     platform: String,
-
-    /// Network interface
-    #[arg(long, default_value = "lo")]
-    interface: String,
 
     /// Authorization Ticket index to use when security is enabled (1 or 2)
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u64).range(1..=2))]
@@ -129,7 +134,7 @@ struct BenchmarkResult {
 impl BenchmarkResult {
     fn to_csv_row(&self) -> String {
         format!(
-            "{},rust,{},{},{},{:.3},{},{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            "{},rust-cv2x,{},{},{},{:.3},{},{:.1},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
             self.run_id,
             self.platform,
             self.security,
@@ -318,21 +323,25 @@ fn cam_btp_request(data: Vec<u8>, security_on: bool) -> BTPDataRequest {
     }
 }
 
-/// Spawn a complete stack: GN + BTP + LinkLayer, with optional security middleware.
-/// Returns (gn_handle, btp_handle).
-/// If `tx_wire_counter` is Some, it is incremented each time a packet is handed to the LL.
+/// Spawn a complete stack: GN + BTP + C-V2X LinkLayer, with optional security middleware.
+/// Returns (gn_handle, btp_handle, stop_flag, ll_rx_join, ll_tx_join).
+/// Call stop_flag.store(true) then join both handles for a graceful C-V2X flow shutdown.
+/// If `tx_wire_counter` is Some, it is incremented each time a packet is handed to the LL (TX).
+/// If `rx_wire_counter` is Some, it is incremented each time a raw packet arrives from the radio (RX).
 fn spawn_stack(
     mib: Mib,
-    mac: [u8; 6],
-    iface: &str,
+    _mac: [u8; 6],
     sign_svc: Option<Arc<Mutex<SignService>>>,
     tx_wire_counter: Option<Arc<AtomicU64>>,
-) -> (RouterHandle, BTPRouterHandle) {
-    // GN router is always spawned WITHOUT security params — security is a middleware
+    rx_wire_counter: Option<Arc<AtomicU64>>,
+) -> (RouterHandle, BTPRouterHandle, Arc<AtomicBool>, thread::JoinHandle<()>, thread::JoinHandle<()>) {
     let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = GNRouter::spawn(mib, None, None, None);
     let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
 
     let (ll_to_gn_tx, ll_to_gn_rx) = mpsc::channel::<Vec<u8>>();
+
+    // The channel that the C-V2X link layer will read from for TX
+    let ll_tx_source: mpsc::Receiver<Vec<u8>>;
 
     if let Some(svc) = sign_svc {
         // ── TX path: GN → sign → LL ─────────────────────────────────────
@@ -374,13 +383,15 @@ fn spawn_stack(
                 }
             }
         });
-        // LL uses the signed output channel
-        RawLinkLayer::new(ll_to_gn_tx, secured_ll_rx, iface, mac).start();
+        ll_tx_source = secured_ll_rx;
+
         // ── RX path: LL → verify → GN ───────────────────────────────────
         let g1 = gn_handle.clone();
         let verify_svc = svc;
+        let rx_cnt_sec = rx_wire_counter;
         thread::spawn(move || {
             while let Ok(packet) = ll_to_gn_rx.recv() {
+                if let Some(ref c) = rx_cnt_sec { c.fetch_add(1, Ordering::Relaxed); }
                 if packet.len() < 4 {
                     g1.send_incoming_packet(packet);
                     continue;
@@ -421,7 +432,6 @@ fn spawn_stack(
         // No security — wire directly, with optional counter
         let wire_cnt = tx_wire_counter;
         if let Some(cnt) = wire_cnt {
-            // Intercept GN→LL to count packets
             let (counted_ll_tx, counted_ll_rx) = mpsc::channel::<Vec<u8>>();
             thread::spawn(move || {
                 while let Ok(packet) = gn_to_ll_rx.recv() {
@@ -429,17 +439,24 @@ fn spawn_stack(
                     let _ = counted_ll_tx.send(packet);
                 }
             });
-            RawLinkLayer::new(ll_to_gn_tx, counted_ll_rx, iface, mac).start();
+            ll_tx_source = counted_ll_rx;
         } else {
-            RawLinkLayer::new(ll_to_gn_tx, gn_to_ll_rx, iface, mac).start();
+            ll_tx_source = gn_to_ll_rx;
         }
+
         let g1 = gn_handle.clone();
+        let rx_cnt_plain = rx_wire_counter;
         thread::spawn(move || {
             while let Ok(p) = ll_to_gn_rx.recv() {
+                if let Some(ref c) = rx_cnt_plain { c.fetch_add(1, Ordering::Relaxed); }
                 g1.send_incoming_packet(p);
             }
         });
     }
+
+    // Wire C-V2X link layer (no interface argument needed)
+    let cv2x_ll = Cv2xLinkLayer::new(ll_to_gn_tx, ll_tx_source);
+    let (stop_flag, ll_rx_join, ll_tx_join) = cv2x_ll.start();
 
     // GN ↔ BTP
     let b1 = btp_handle.clone();
@@ -455,11 +472,11 @@ fn spawn_stack(
         }
     });
 
-    (gn_handle, btp_handle)
+    (gn_handle, btp_handle, stop_flag, ll_rx_join, ll_tx_join)
 }
 
 // ── Security setup ──────────────────────────────────────────────────────────
-/// Build a security stack by loading certificate files from `certs_dir`.
+/// Build the security stack by loading certificate files from `certs_dir`.
 /// Expects: root_ca.cert, aa.cert, at1.cert, at2.cert, at1.key / at2.key.
 /// Generate them once with: `python python/generate_certs.py`
 /// Both TX and RX devices must share the same certificate chain so that
@@ -508,58 +525,7 @@ fn build_security_stack(at_index: usize, certs_dir: &str) -> Arc<Mutex<SignServi
     Arc::new(Mutex::new(sign_service))
 }
 
-/// Create two independent SignService instances from the same cert chain on disk.
-/// TX uses at1 for signing, RX uses at2. Both share the same trust anchor so
-/// signatures produced by one can be verified by the other.
-/// Separate backends = no Mutex contention between the two stacks.
-fn build_security_stack_pair(certs_dir: &str) -> (Arc<Mutex<SignService>>, Arc<Mutex<SignService>>) {
-    let cert_dir = Path::new(certs_dir);
-
-    let root_bytes = fs::read(cert_dir.join("root_ca.cert"))
-        .expect("root_ca.cert not found — run python/generate_certs.py first");
-    let aa_bytes = fs::read(cert_dir.join("aa.cert"))
-        .expect("aa.cert not found — run python/generate_certs.py first");
-    let at1_bytes = fs::read(cert_dir.join("at1.cert")).expect("at1.cert not found");
-    let at2_bytes = fs::read(cert_dir.join("at2.cert")).expect("at2.cert not found");
-    let at1_key = fs::read(cert_dir.join("at1.key")).expect("at1.key not found");
-    let at2_key = fs::read(cert_dir.join("at2.key")).expect("at2.key not found");
-
-    // ── TX service (signs with at1) ──────────────────────────────────────
-    let mut tx_backend = EcdsaBackend::new();
-    let tx_key_id = tx_backend.import_signing_key(&at1_key);
-    let tx_root = Certificate::from_bytes(&root_bytes, None);
-    let tx_aa = Certificate::from_bytes(&aa_bytes, Some(tx_root.clone()));
-    let tx_at1 = Certificate::from_bytes(&at1_bytes, Some(tx_aa.clone()));
-    let tx_at2 = Certificate::from_bytes(&at2_bytes, Some(tx_aa.clone()));
-    let tx_cert_lib = CertificateLibrary::new(
-        &tx_backend,
-        vec![tx_root],
-        vec![tx_aa],
-        vec![tx_at1.clone(), tx_at2],
-    );
-    let mut tx_sign = SignService::new(tx_backend, tx_cert_lib);
-    tx_sign.add_own_certificate(OwnCertificate::new(tx_at1, tx_key_id));
-
-    // ── RX service (signs with at2, independent backend) ─────────────────
-    let mut rx_backend = EcdsaBackend::new();
-    let rx_key_id = rx_backend.import_signing_key(&at2_key);
-    let rx_root = Certificate::from_bytes(&root_bytes, None);
-    let rx_aa = Certificate::from_bytes(&aa_bytes, Some(rx_root.clone()));
-    let rx_at1 = Certificate::from_bytes(&at1_bytes, Some(rx_aa.clone()));
-    let rx_at2 = Certificate::from_bytes(&at2_bytes, Some(rx_aa.clone()));
-    let rx_cert_lib = CertificateLibrary::new(
-        &rx_backend,
-        vec![rx_root],
-        vec![rx_aa],
-        vec![rx_at2.clone(), rx_at1],
-    );
-    let mut rx_sign = SignService::new(rx_backend, rx_cert_lib);
-    rx_sign.add_own_certificate(OwnCertificate::new(rx_at2, rx_key_id));
-
-    (Arc::new(Mutex::new(tx_sign)), Arc::new(Mutex::new(rx_sign)))
-}
-
-// ── Benchmark: TX Throughput ────────────────────────────────────────────────
+// ── Benchmark: TX Throughput (C-V2X) ────────────────────────────────────────
 fn bench_tx(args: &Args) -> BenchmarkResult {
     let mac = random_mac();
     let mut mib = Mib::new();
@@ -571,7 +537,7 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let wire_counter = Arc::new(AtomicU64::new(0));
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
-    let (gn_handle, btp_handle) = spawn_stack(mib, mac, &args.interface, sign_svc, Some(Arc::clone(&wire_counter)));
+    let (gn_handle, btp_handle, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(mib, mac, sign_svc, Some(Arc::clone(&wire_counter)), None);
 
     // Seed position vector
     let mut epv = LongPositionVector::decode([0u8; 24]);
@@ -581,20 +547,22 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let coder = CamCoder::new();
     let template = make_cam(station_id);
-    // Warm-up: feed packets to saturate the pipeline
+
+    // Warm-up: rate-limited to ~10 Hz so the router queue doesn't overflow and
+    // pollute the measurement phase with backlogged packets.
     println!("  Warm-up phase ({}s)...", args.warmup);
     let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
     while Instant::now() < warmup_end {
         if let Ok(data) = coder.encode(&template) {
             btp_handle.send_btp_data_request(cam_btp_request(data, security_on));
         }
+        thread::sleep(Duration::from_millis(100));
     }
 
-    // Let pipeline drain after warmup
-    thread::sleep(Duration::from_millis(200));
+    // Drain any remaining queued packets from warm-up before measurement.
+    thread::sleep(Duration::from_millis(500));
 
-    // Measurement: send packets sequentially, measure full-stack TX latency per packet
-    // (encode → BTP → GN → optional security sign → link layer)
+    // Measurement
     println!("  Measurement phase ({}s)...", args.duration);
     let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
     wire_counter.store(0, Ordering::SeqCst);
@@ -619,8 +587,25 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
     let total = latencies.len() as u64;
     let throughput = total as f64 / elapsed;
 
+    println!("  TX: {} CAMs ({:.0}/s)", total, throughput);
+
     let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
         compute_stats(&mut latencies);
+
+    // Graceful C-V2X shutdown:
+    // 1. stop_flag signals the CV2X RX thread (poll loop checks every 100ms).
+    // 2. gn_handle.shutdown() sends RouterInput::Shutdown to the GN router, causing it to
+    //    exit its run() loop and drop link_layer_tx. This closes the GN→LL TX bridging
+    //    thread, which drops the CV2X LL's gn_rx sender → CV2X TX thread exits.
+    //    (Simply dropping gn_handle is insufficient because the beacon timer thread holds
+    //    a clone of input_tx, keeping the router alive indefinitely.)
+    eprintln!("tearing down C-V2X flows...");
+    stop_flag.store(true, Ordering::SeqCst);
+    gn_handle.shutdown();
+    btp_handle.shutdown();
+    let _ = ll_rx_join.join(); // exits within ~100ms via poll timeout + stop_flag
+    let _ = ll_tx_join.join(); // exits once GN router closes the link_layer_tx chain
+    eprintln!("shutdown complete");
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -641,167 +626,7 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
     }
 }
 
-// ── Benchmark: Concurrent TX/RX ────────────────────────────────────────────
-fn bench_concurrent(args: &Args) -> BenchmarkResult {
-    // Two separate stacks (different GN addresses) so the GN router's
-    // Duplicate Address Detection doesn't drop loopback packets.
-    let tx_mac = random_mac();
-    let mut tx_mib = Mib::new();
-    tx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(tx_mac));
-    tx_mib.itsGnBeaconServiceRetransmitTimer = 0;
-    let station_id = u32::from_be_bytes([tx_mac[2], tx_mac[3], tx_mac[4], tx_mac[5]]);
-    let security_on = args.security == "on";
-
-    let wire_counter = Arc::new(AtomicU64::new(0));
-
-    let (tx_sign_svc, rx_sign_svc) = if security_on {
-        let (tx, rx) = build_security_stack_pair(&args.certs_dir);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, Some(Arc::clone(&wire_counter)));
-
-    let mut tx_epv = LongPositionVector::decode([0u8; 24]);
-    tx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
-    tx_gn.update_position_vector(tx_epv);
-
-    // RX stack
-    let rx_mac = {
-        let mut m = random_mac();
-        m[5] = m[5].wrapping_add(1);
-        m
-    };
-    let mut rx_mib = Mib::new();
-    rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
-    rx_mib.itsGnBeaconServiceRetransmitTimer = 0;
-
-    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None);
-
-    let mut rx_epv = LongPositionVector::decode([0u8; 24]);
-    rx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
-    rx_gn.update_position_vector(rx_epv);
-
-    // Register RX on BTP port 2001
-    let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
-    rx_btp.register_port(2001, cam_ind_tx);
-
-    thread::sleep(Duration::from_millis(50));
-
-    // Shared counters
-    let rx_count = Arc::new(AtomicU64::new(0));
-    let rx_errors = Arc::new(AtomicU64::new(0));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-
-    // RX thread
-    {
-        let cnt = rx_count.clone();
-        let err = rx_errors.clone();
-        let stop = stop_flag.clone();
-        thread::spawn(move || {
-            let coder = CamCoder::new();
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(ind) => {
-                        match coder.decode(&ind.data) {
-                            Ok(_) => {
-                                cnt.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                err.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                }
-            }
-        });
-    }
-
-    let coder = CamCoder::new();
-
-    // Warm-up
-    println!("  Warm-up phase ({}s)...", args.warmup);
-    let warmup_end = Instant::now() + Duration::from_secs(args.warmup);
-    while Instant::now() < warmup_end {
-        if let Ok(data) = coder.encode(&make_cam(station_id)) {
-            tx_btp.send_btp_data_request(cam_btp_request(data, security_on));
-        }
-    }
-
-    // Let pipeline drain after warmup
-    thread::sleep(Duration::from_millis(200));
-
-    // Measurement: send packets sequentially, measure full end-to-end TX→RX latency
-    // (encode → TX BTP → TX GN → optional sign → TX LL → wire →
-    //  RX LL → optional verify → RX GN → RX BTP → decode)
-    println!("  Measurement phase ({}s)...", args.duration);
-    let mut latencies: Vec<f64> = Vec::with_capacity(500_000);
-    wire_counter.store(0, Ordering::SeqCst);
-    rx_count.store(0, Ordering::SeqCst);
-    rx_errors.store(0, Ordering::SeqCst);
-
-    let bench_start = Instant::now();
-    let bench_end = bench_start + Duration::from_secs(args.duration);
-
-    while Instant::now() < bench_end {
-        let prev_rx = rx_count.load(Ordering::SeqCst);
-        let t0 = Instant::now();
-        if let Ok(data) = coder.encode(&make_cam(station_id)) {
-            tx_btp.send_btp_data_request(cam_btp_request(data, security_on));
-            // Wait for the packet to traverse the full TX→wire→RX pipeline
-            while rx_count.load(Ordering::Acquire) == prev_rx {
-                std::hint::spin_loop();
-            }
-            let t1 = Instant::now();
-            latencies.push(t1.duration_since(t0).as_secs_f64() * 1e6);
-        }
-    }
-
-    let tx_total = wire_counter.load(Ordering::SeqCst);
-    let rx_total = rx_count.load(Ordering::SeqCst);
-    let elapsed = bench_start.elapsed().as_secs_f64();
-
-    stop_flag.store(true, Ordering::Relaxed);
-    thread::sleep(Duration::from_millis(200));
-
-    let total = latencies.len() as u64;
-    let throughput = total as f64 / elapsed;
-
-    println!(
-        "  TX (wire): {} CAMs ({:.0}/s), RX: {} CAMs ({:.0}/s)",
-        tx_total, tx_total as f64 / elapsed, rx_total, rx_total as f64 / elapsed
-    );
-
-    let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
-        compute_stats(&mut latencies);
-
-    BenchmarkResult {
-        run_id: args.run_id,
-        platform: args.platform.clone(),
-        security: args.security.clone(),
-        benchmark: "concurrent".to_string(),
-        duration_s: elapsed,
-        total_cams: total,
-        throughput,
-        latency_mean: lat_mean,
-        latency_std: lat_std,
-        latency_p50: lat_p50,
-        latency_p95: lat_p95,
-        latency_p99: lat_p99,
-        latency_min: lat_min,
-        latency_max: lat_max,
-        sign_latency_mean: 0.0,
-    }
-}
-
-// ── Benchmark: RX Throughput (receive-only) ─────────────────────────────────
-// Listens on the network interface for incoming CAMs sent by a remote sender
-// (e.g. another machine running `--mode tx`). No internal TX stack is spawned.
+// ── Benchmark: RX Throughput (C-V2X, receive-only) ──────────────────────────
 fn bench_rx(args: &Args) -> BenchmarkResult {
     let rx_mac = random_mac();
     let mut rx_mib = Mib::new();
@@ -810,7 +635,8 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let security_on = args.security == "on";
 
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
-    let (_rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, sign_svc, None);
+    let rx_ll_counter = Arc::new(AtomicU64::new(0));
+    let (rx_gn, rx_btp, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(rx_mib, rx_mac, sign_svc, None, Some(Arc::clone(&rx_ll_counter)));
 
     // Register RX on BTP port 2001
     let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
@@ -862,10 +688,27 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let total = latencies.len() as u64;
     let throughput = total as f64 / elapsed;
 
-    println!("  RX: {} CAMs ({:.0}/s), errors: {}", total, throughput, rx_errors);
+    let ll_rx_count = rx_ll_counter.load(Ordering::SeqCst);
+    println!("  RX radio: {} raw frames from C-V2X radio", ll_rx_count);
+    println!("  RX stack: {} CAMs delivered to BTP ({:.0}/s), errors: {}", total, throughput, rx_errors);
+    if ll_rx_count == 0 {
+        eprintln!("  [WARN] No packets received from C-V2X radio. Is the remote TX device running?");
+    } else if total == 0 {
+        eprintln!("  [WARN] {} raw frames received but 0 CAMs decoded — GN/BTP may be dropping packets.", ll_rx_count);
+    }
 
     let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
         compute_stats(&mut latencies);
+
+    // Same shutdown sequence as bench_tx: explicit shutdown() calls are required so the GN
+    // router exits despite the beacon timer thread holding a live clone of input_tx.
+    eprintln!("tearing down C-V2X flows...");
+    stop_flag.store(true, Ordering::SeqCst);
+    rx_gn.shutdown();
+    rx_btp.shutdown();
+    let _ = ll_rx_join.join(); // exits within ~100ms via poll timeout + stop_flag
+    let _ = ll_tx_join.join(); // exits once GN router closes the link_layer_tx chain
+    eprintln!("shutdown complete");
 
     BenchmarkResult {
         run_id: args.run_id,
@@ -936,7 +779,7 @@ fn bench_codec(args: &Args) -> BenchmarkResult {
     BenchmarkResult {
         run_id: args.run_id,
         platform: args.platform.clone(),
-        security: "off".to_string(), // Security N/A for codec
+        security: "off".to_string(),
         benchmark: args.mode.clone(),
         duration_s: elapsed,
         total_cams: total,
@@ -962,11 +805,7 @@ fn bench_security(args: &Args) -> BenchmarkResult {
     let encoded = coder.encode(&template).expect("Failed to encode template CAM");
     println!("  CAM payload size: {} bytes", encoded.len());
 
-    // Build a realistic GN packet payload (CommonHeader + payload) to sign
-    // This is what the sign middleware receives: everything after BasicHeader.
-    // We use the raw encoded CAM as the tbs_message, matching the real stack path.
     let tbs_message = encoded.clone();
-
     let sign_svc = build_security_stack(args.at as usize, &args.certs_dir);
 
     // Pre-sign one message to get a signed envelope for the verify benchmark
@@ -1058,7 +897,7 @@ fn bench_security(args: &Args) -> BenchmarkResult {
     BenchmarkResult {
         run_id: args.run_id,
         platform: args.platform.clone(),
-        security: "on".to_string(), // Security is the thing being measured
+        security: "on".to_string(),
         benchmark: args.mode.clone(),
         duration_s: elapsed,
         total_cams: total,
@@ -1079,7 +918,7 @@ fn main() {
     let args = Args::parse();
 
     println!("{}", "=".repeat(60));
-    println!("FlexStack Benchmark — Rust (release, LTO)");
+    println!("FlexStack Benchmark — Rust C-V2X (release, LTO)");
     println!("{}", "=".repeat(60));
     println!("  Mode     : {}", args.mode);
     println!("  Security : {}", args.security);
@@ -1090,7 +929,6 @@ fn main() {
     println!("  Duration : {}s", args.duration);
     println!("  Warm-up  : {}s", args.warmup);
     println!("  Platform : {}", args.platform);
-    println!("  Interface: {}", args.interface);
     println!("  Run ID   : {}", args.run_id);
     println!("  Output   : {}", args.output);
     println!();
@@ -1098,7 +936,6 @@ fn main() {
     let result = match args.mode.as_str() {
         "tx" => bench_tx(&args),
         "rx" => bench_rx(&args),
-        "concurrent" => bench_concurrent(&args),
         "codec-encode" | "codec-decode" => bench_codec(&args),
         "security-sign" | "security-verify" => bench_security(&args),
         _ => {
