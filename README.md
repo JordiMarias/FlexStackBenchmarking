@@ -50,15 +50,33 @@ Each cell: **30 independent runs × 60s measurement** with warm-up discard (5s C
 
 ### 1. Prerequisites
 
+#### Python
+
 ```bash
-# Python (CPython 3.13)
-pip install v2xflexstack==0.11.0 numpy
+# CPython 3.13
+pip install v2xflexstack==0.11.1 numpy
 
 # PyPy (optional)
-pypy3 -m pip install v2xflexstack==0.11.0 numpy
+pypy3 -m pip install v2xflexstack==0.11.1 numpy
+```
 
-# Rust
+#### Rust Binary
+
+The fastest way to get started is to download the pre-built binary directly from the latest GitHub release — no Rust toolchain required:
+
+```bash
+wget https://github.com/JordiMarias/FlexStackBenchmarking/releases/download/v0.2.0/flexstack-bench-$(uname -m)-linux
+chmod +x flexstack-bench-$(uname -m)-linux
+./flexstack-bench-$(uname -m)-linux --help
+```
+
+The `$(uname -m)` shell substitution resolves automatically to your CPU architecture — `x86_64` on a laptop/desktop or `aarch64` on a Raspberry Pi 4/5. No cross-compilation or Rust toolchain needed.
+
+Alternatively, build from source:
+
+```bash
 cd rust && cargo build --release
+# Binary: rust/target/release/flexstack-bench
 ```
 
 ### 2. Generate Certificates (for secured benchmarks)
@@ -82,12 +100,18 @@ sudo python3 python/benchmark.py --mode tx --security on --duration 60 --warmup 
 # PyPy TX benchmark (15s JIT warm-up)
 sudo pypy3 python/benchmark.py --mode tx --security off --duration 60 --warmup 15
 
-# Rust TX benchmark
+# Rust TX benchmark — using pre-built binary (replace arch as needed)
+sudo ./flexstack-bench-$(uname -m)-linux --mode tx --security off --duration 60
+
+# Rust TX benchmark — using locally compiled binary
 sudo rust/target/release/flexstack-bench --mode tx --security off --duration 60
+
+# Rust TX benchmark (secured, using AT1 certificate)
+sudo ./flexstack-bench-$(uname -m)-linux --mode tx --security on --certs-dir certs --at 1 --duration 60
 
 # Codec benchmarks (no sudo needed)
 python3 python/benchmark.py --mode codec-encode --duration 60
-rust/target/release/flexstack-bench --mode codec-decode --duration 60
+./flexstack-bench-$(uname -m)-linux --mode codec-decode --duration 60
 ```
 
 ### 4. Run Full Benchmark Suite
@@ -181,6 +205,8 @@ OPTIONS:
   --run-id <integer>                                   Run identifier
   --platform <laptop|rpi3|rpi5>                        Platform tag
   --interface <iface>                                  Network interface [lo]
+  --certs-dir <path>       (Rust) Path to certificate directory [certs]
+  --at <1|2>               (Rust) Authorization Ticket index to use [1]
 ```
 
 ## CSV Output Format
@@ -236,8 +262,8 @@ cargo build --release --target aarch64-unknown-linux-gnu
 
 | Component | Version |
 |-----------|---------|
-| Python FlexStack | v2xflexstack 0.11.0 |
-| Rust FlexStack | rustflexstack 0.2.1 |
+| Python FlexStack | v2xflexstack 0.11.1 |
+| Rust FlexStack | rustflexstack 0.3.0 |
 | CPython | 3.13 |
 | PyPy | 3.11 |
 | Rust | stable (1.75+), `--release`, LTO |
