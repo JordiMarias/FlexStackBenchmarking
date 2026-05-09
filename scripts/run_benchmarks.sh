@@ -36,10 +36,13 @@ PYTHON_BENCH="$PROJECT_DIR/python/benchmark.py"
 
 # Python interpreters (adjust paths as needed)
 CPYTHON="${CPYTHON:-$PROJECT_DIR/venv/bin/python3}"
-PYPY="${PYPY:-pypy3}"
+PYPY="${PYPY:-$PROJECT_DIR/pypy/bin/pypy3}"
 
 # CPU cores for process pinning
 BENCH_CORES="${BENCH_CORES:-2,3}"
+
+# Network interface for TX/RX/concurrent benchmarks
+BENCH_INTERFACE="${BENCH_INTERFACE:-lo}"
 
 echo "============================================================"
 echo "FlexStack Benchmark Orchestrator"
@@ -94,6 +97,8 @@ run_cell() {
           --duration "$DURATION" --warmup "$WARMUP" \
           --output "$OUTPUT" --run-id "$RUN" \
           --platform "$PLATFORM" \
+          --interface "$BENCH_INTERFACE" \
+          --certs-dir "$PROJECT_DIR/certs" \
           2>&1 || echo "  [WARN] Rust benchmark exited with error"
         ;;
       cpython)
@@ -103,6 +108,7 @@ run_cell() {
           --duration "$DURATION" --warmup "$WARMUP" \
           --output "$OUTPUT" --run-id "$RUN" \
           --platform "$PLATFORM" \
+          --interface "$BENCH_INTERFACE" \
           2>&1 || echo "  [WARN] CPython benchmark exited with error"
         ;;
       pypy)
@@ -112,6 +118,7 @@ run_cell() {
           --duration "$DURATION" --warmup "$WARMUP" \
           --output "$OUTPUT" --run-id "$RUN" \
           --platform "$PLATFORM" \
+          --interface "$BENCH_INTERFACE" \
           2>&1 || echo "  [WARN] PyPy benchmark exited with error"
         ;;
     esac
