@@ -52,6 +52,10 @@
 
   vars:
     rx_interface: "{{ rx_interface | default('eth0') }}"
+    # Optional: explicitly name the sender host (inventory hostname).
+    # When set, automatic rank-based assignment is skipped.
+    # Example: -e rx_sender=desktop
+    rx_sender: "{{ rx_sender | default('') }}"
 
   tasks:
     - name: Validate exactly 2 hosts targeted
@@ -78,15 +82,21 @@
         # The host with the HIGHER rank is the sender (more powerful).
         # The host with the LOWER rank is the receiver (DUT).
         # On equal rank, first alphabetically sends.
+        # Override automatic assignment with -e rx_sender=<inventory_hostname>.
         rx_role: >-
-          {%- set hosts_ranked = [] -%}
-          {%- for h in ansible_play_hosts -%}
-            {%- set rank = hostvars[h].platform_rank | int -%}
-            {%- set _ = hosts_ranked.append({'name': h, 'rank': rank}) -%}
-          {%- endfor -%}
-          {%- set sorted_hosts = hosts_ranked | sort(attribute='rank') | reverse | list -%}
-          {%- if inventory_hostname == sorted_hosts[0].name -%}sender
-          {%- else -%}receiver{%- endif -%}
+          {%- if rx_sender != '' -%}
+            {%- if inventory_hostname == rx_sender -%}sender{%- else -%}receiver{%- endif -%}
+          {%- else -%}
+            {%- set hosts_ranked = [] -%}
+            {%- for h in ansible_play_hosts -%}
+              {%- set rank = hostvars[h].platform_rank | int -%}
+              {%- set _ = hosts_ranked.append({'name': h, 'rank': rank}) -%}
+            {%- endfor -%}
+            {%- set by_name = hosts_ranked | sort(attribute='name') -%}
+            {%- set sorted_hosts = by_name | sort(attribute='rank') | reverse | list -%}
+            {%- if inventory_hostname == sorted_hosts[0].name -%}sender
+            {%- else -%}receiver{%- endif -%}
+          {%- endif -%}
 
     - name: Display role assignments
       debug:
@@ -101,9 +111,16 @@
 
   vars:
     tx_interface: "{{ tx_interface | default(rx_interface | default('eth0')) }}"
-    # Send for long enough to cover all receiver runs.
-    # 6 cells (3 impls × 2 security) × 30 runs × (60s + 15s warmup + 10s cooldown) + 1h buffer
-    rx_send_duration: "{{ ((6 * bench_runs | int * (bench_duration | int + 15 + bench_cooldown | int)) + 3600) | int }}"
+    rx_impl_filter: "{{ rx_impl_filter | default([]) }}"
+    # Optional security filter. Default (empty list) = run both off and on.
+    # Example: -e 'rx_security_filter=[on]'
+    rx_security_filter: "{{ rx_security_filter | default([]) }}"
+    # Number of active impl×security cells, accounting for both filters.
+    _rx_active_impls: "{{ (['rust','cpython','pypy'] | select('in', rx_impl_filter) | list) if rx_impl_filter else ['rust','cpython','pypy'] }}"
+    _rx_active_securities: "{{ (['off','on'] | select('in', rx_security_filter) | list) if rx_security_filter else ['off','on'] }}"
+    _rx_cell_count: "{{ (_rx_active_impls | length) * (_rx_active_securities | length) }}"
+    # Send long enough to cover all receiver runs plus a 30-min buffer.
+    rx_send_duration: "{{ ((_rx_cell_count | int * bench_runs | int * (bench_duration | int + bench_warmup_pypy | int + bench_cooldown | int)) + 1800) | int }}"
     rust_bin: "{{ bench_dir }}/rust/target/release/flexstack-bench"
     sender_log: "{{ bench_dir }}/results/bench_rx_sender.log"
     sender_pidfile: "{{ bench_dir }}/results/bench_rx_sender.pid"
@@ -146,19 +163,33 @@
           echo "============================================================"
           echo "RX Benchmark — Sender on {{ inventory_hostname }}"
           echo "Interface: {{ tx_interface }}"
-          echo "Duration : {{ rx_send_duration }}s"
-          echo "Security : off (unsecured packets)"
+          echo "Duration : {{ rx_send_duration }}s per security phase"
           echo "Started  : $(date)"
           echo "============================================================"
 
-          # Send unsecured packets first (receiver runs security=off first)
-          echo "[$(date '+%H:%M:%S')] Sending unsecured CAMs..."
+          {% if not rx_security_filter or 'off' in rx_security_filter %}
+          echo "[$(date '+%H:%M:%S')] Phase 1: Sending unsecured CAMs (security=off)..."
+          cd {{ bench_dir }}
           {{ rust_bin }} \
             --mode tx --security off \
             --duration {{ rx_send_duration }} --warmup 0 \
             --interface {{ tx_interface }} \
             --output /dev/null --platform {{ bench_platform }} --run-id 1 \
-            || echo "[WARN] Sender exited with error"
+            || echo "[WARN] Sender (security=off) exited with error"
+          echo "[$(date '+%H:%M:%S')] Phase 1 finished"
+          {% endif %}
+
+          {% if not rx_security_filter or 'on' in rx_security_filter %}
+          echo "[$(date '+%H:%M:%S')] Phase 2: Sending secured CAMs (security=on, AT1)..."
+          cd {{ bench_dir }}
+          {{ rust_bin }} \
+            --mode tx --security on \
+            --duration {{ rx_send_duration }} --warmup 0 \
+            --interface {{ tx_interface }} \
+            --output /dev/null --platform {{ bench_platform }} --run-id 1 \
+            || echo "[WARN] Sender (security=on) exited with error"
+          echo "[$(date '+%H:%M:%S')] Phase 2 finished"
+          {% endif %}
 
           echo "[$(date '+%H:%M:%S')] Sender finished"
           rm -f {{ sender_pidfile }}
@@ -204,6 +235,16 @@
       - { security: "off", impl: [rust, cpython, pypy] }
       - { security: "on",  impl: [rust, cpython, pypy] }
 
+    # Optional implementation filter — when set via -e, only the listed
+    # implementations are run.  Default (empty list) means run all.
+    # Example: -e 'rx_impl_filter=[pypy]'
+    # Example: -e 'rx_impl_filter=[rust,pypy]'
+    rx_impl_filter: "{{ rx_impl_filter | default([]) }}"
+    # Optional security filter — when set, only matching security modes are run.
+    # Example: -e 'rx_security_filter=[on]'
+    # Example: -e 'rx_security_filter=[off,on]'
+    rx_security_filter: "{{ rx_security_filter | default([]) }}"
+
   tasks:
     - name: Skip if not receiver
       meta: end_host
@@ -235,6 +276,9 @@
           echo $$ > {{ run_pidfile }}
           exec > >(tee -a {{ run_log }}) 2>&1
 
+          # Run from bench_dir so the Rust binary finds certs/ by relative path
+          cd {{ bench_dir }}
+
           echo "============================================================"
           echo "RX Benchmark — Receiver on {{ inventory_hostname }} ({{ bench_platform }})"
           echo "Interface: {{ rx_interface }}"
@@ -243,7 +287,9 @@
           echo "============================================================"
 
           {% for cell in rx_modes %}
+          {% if not rx_security_filter or cell.security in rx_security_filter %}
           {% for impl in cell.impl %}
+          {% if not rx_impl_filter or impl in rx_impl_filter %}
           {% set warmup = bench_warmup_pypy if impl == 'pypy' else (bench_warmup_cpython if impl == 'cpython' else bench_warmup_rust) %}
           echo ""
           echo "================================================================"
@@ -255,6 +301,7 @@
             chrt -f 50 taskset -c {{ bench_cores }} \
               {{ rust_bin }} \
               --mode rx --security {{ cell.security }} \
+              --at 2 \
               --duration {{ bench_duration }} --warmup {{ warmup }} \
               --output {{ results_csv }} --run-id $RUN \
               --platform {{ bench_platform }} \
@@ -282,7 +329,9 @@
             fi
           done
 
+          {% endif %}
           {% endfor %}
+          {% endif %}
           {% endfor %}
           echo ""
           echo "============================================================"
