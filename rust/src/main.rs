@@ -22,6 +22,12 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref RX_TIMESTAMPS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+}
 
 use rustflexstack::btp::router::{BTPRouterHandle, Router as BTPRouter};
 use rustflexstack::btp::service_access_point::{BTPDataIndication, BTPDataRequest};
@@ -381,6 +387,9 @@ fn spawn_stack(
         let verify_svc = svc;
         thread::spawn(move || {
             while let Ok(packet) = ll_to_gn_rx.recv() {
+                let t0 = Instant::now();
+                RX_TIMESTAMPS.lock().unwrap().push_back(t0);
+                
                 if packet.len() < 4 {
                     g1.send_incoming_packet(packet);
                     continue;
@@ -411,6 +420,9 @@ fn spawn_stack(
                             let plain: Vec<u8> = new_bh.encode().iter().copied()
                                 .chain(confirm.plain_message.iter().copied()).collect();
                             g1.send_incoming_packet(plain);
+                        } else {
+                            let mut q = RX_TIMESTAMPS.lock().unwrap();
+                            if !q.is_empty() { q.pop_front(); }
                         }
                     }
                     _ => g1.send_incoming_packet(packet),
@@ -436,6 +448,8 @@ fn spawn_stack(
         let g1 = gn_handle.clone();
         thread::spawn(move || {
             while let Ok(p) = ll_to_gn_rx.recv() {
+                let t0 = Instant::now();
+                RX_TIMESTAMPS.lock().unwrap().push_back(t0);
                 g1.send_incoming_packet(p);
             }
         });
@@ -693,30 +707,26 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
     let rx_errors = Arc::new(AtomicU64::new(0));
     let stop_flag = Arc::new(AtomicBool::new(false));
 
-    // RX thread
+    // RX thread — use blocking recv() so rx_count is incremented immediately
+    // when the packet completes the full pipeline (verify → GN → BTP → decode).
+    // recv_timeout() would introduce up to 100ms of polling lag, making the
+    // spin-wait in the measurement loop measure scheduling jitter rather than
+    // actual end-to-end latency.
     {
         let cnt = rx_count.clone();
         let err = rx_errors.clone();
         let stop = stop_flag.clone();
         thread::spawn(move || {
             let coder = CamCoder::new();
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
+            while !stop.load(Ordering::Relaxed) {
+                match cam_ind_rx.recv() {
                     Ok(ind) => {
                         match coder.decode(&ind.data) {
-                            Ok(_) => {
-                                cnt.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => {
-                                err.fetch_add(1, Ordering::Relaxed);
-                            }
+                            Ok(_) => { cnt.fetch_add(1, Ordering::Release); }
+                            Err(_) => { err.fetch_add(1, Ordering::Relaxed); }
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(_) => break, // channel disconnected
                 }
             }
         });
@@ -842,7 +852,7 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     while Instant::now() < bench_end {
         match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ind) => {
-                let t0 = Instant::now();
+                let t0 = RX_TIMESTAMPS.lock().unwrap().pop_front().unwrap_or_else(Instant::now);
                 match coder_rx.decode(&ind.data) {
                     Ok(_) => {
                         let t1 = Instant::now();

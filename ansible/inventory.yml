@@ -21,7 +21,7 @@ all:
     pypy_version: "pypy3.11-v7.3.21"
 
     # ── Rust binary release ─────────────────────────────────────────────────
-    rust_release_tag: "v0.2.1"
+    rust_release_tag: "v0.2.2"
     rust_release_base: "https://github.com/JordiMarias/FlexStackBenchmarking/releases/download/{{ rust_release_tag }}"
 
     # ── Benchmark parameters ────────────────────────────────────────────────
@@ -53,8 +53,8 @@ all:
       # - { mode: rx, security: "off", impl: [rust, cpython, pypy] }
       # - { mode: rx, security: "on",  impl: [rust, cpython, pypy] }
       # B3: Concurrent TX/RX
-      - { mode: concurrent, security: "off", impl: [rust, cpython, pypy] }
-      - { mode: concurrent, security: "on",  impl: [rust, cpython, pypy] }
+      # - { mode: concurrent, security: "off", impl: [rust, cpython, pypy] }
+      # - { mode: concurrent, security: "on",  impl: [rust, cpython, pypy] }
       # B4: ASN.1 Codec (no security, no networking)
       - { mode: codec-encode,  security: "off", impl: [rust, cpython, pypy] }
       - { mode: codec-decode,  security: "off", impl: [rust, cpython, pypy] }
@@ -75,7 +75,7 @@ all:
         laptop-1:
           ansible_host: 172.27.9.198
           ansible_user: v2xi2cat
-          ansible_become_password: v2X@i2cat!2025
+          ansible_become_password: [PASSWORD]
 
     rpi3:
       vars:
@@ -102,4 +102,4 @@ all:
         rpi5-node1:
           ansible_host: 192.168.59.50
           ansible_user: v2xi2cat
-          ansible_become_password: v2X@i2cat!2022
+          ansible_become_password: [PASSWORD]

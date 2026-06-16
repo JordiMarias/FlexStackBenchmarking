@@ -375,7 +375,6 @@ def bench_tx(args):
     # Don't start the CA service timer — we send directly via BTP
     coder = CAMCoder()
     cam_value = _make_cam_value(station_id)
-    encoded_cam = coder.encode(cam_value)
 
     def make_btp_request(data):
         return BTPDataRequest(
@@ -405,7 +404,7 @@ def bench_tx(args):
     print(f"  Warm-up phase ({args.warmup}s)...")
     warmup_end = time.monotonic_ns() + args.warmup * 10**9
     while time.monotonic_ns() < warmup_end:
-        btp_router.btp_data_request(make_btp_request(encoded_cam))
+        btp_router.btp_data_request(make_btp_request(coder.encode(cam_value)))
 
     # Measurement — each call is synchronous to wire
     print(f"  Measurement phase ({args.duration}s)...")
@@ -416,7 +415,7 @@ def bench_tx(args):
 
     while time.monotonic_ns() < deadline:
         t0 = time.monotonic_ns()
-        btp_router.btp_data_request(make_btp_request(encoded_cam))
+        btp_router.btp_data_request(make_btp_request(coder.encode(cam_value)))
         t1 = time.monotonic_ns()
         latencies.append((t1 - t0) / 1000)  # μs
         count += 1
@@ -484,14 +483,14 @@ def bench_concurrent(args):
     rx_gn_router.register_indication_callback(rx_btp_router.btp_data_indication)
 
     rx_counter = {"count": 0}
-    rx_event = threading.Event()
+    rx_lock = threading.Lock()
     coder_rx = CAMCoder()
 
     def rx_btp_callback(indication: BTPDataIndication):
         try:
             coder_rx.decode(indication.data)
-            rx_counter["count"] += 1
-            rx_event.set()
+            with rx_lock:
+                rx_counter["count"] += 1
         except Exception:
             pass
 
@@ -508,7 +507,6 @@ def bench_concurrent(args):
     # ── CAM encoding ─────────────────────────────────────────────────────
     coder = CAMCoder()
     cam_value = _make_cam_value(tx_station_id)
-    encoded_cam = coder.encode(cam_value)
 
     def make_btp_request(data):
         return BTPDataRequest(
@@ -538,22 +536,32 @@ def bench_concurrent(args):
     print(f"  Warm-up phase ({args.warmup}s)...")
     warmup_end = time.monotonic_ns() + args.warmup * 10**9
     while time.monotonic_ns() < warmup_end:
-        tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
+        tx_btp_router.btp_data_request(make_btp_request(coder.encode(cam_value)))
     rx_counter["count"] = 0  # Reset after warm-up
     time.sleep(0.2)  # Let pipeline drain
 
-    # Measurement — send sequentially, wait for RX callback per packet
-    # Measures full end-to-end latency: TX BTP → TX GN → sign → wire → RX LL → verify → RX GN → RX BTP → decode
+    # Measurement — send sequentially, poll until RX counter advances per packet.
+    # Measures full end-to-end latency: encode → TX BTP → TX GN → sign → wire → RX LL → verify → RX GN → RX BTP → decode.
+    # Using a counter comparison (not Event.clear/wait) avoids the race where a
+    # late callback from the previous packet spuriously unblocks the wait early.
     print(f"  Measurement phase ({args.duration}s)...")
     latencies = []
     t_start = time.monotonic_ns()
     deadline = t_start + args.duration * 10**9
 
     while time.monotonic_ns() < deadline:
-        rx_event.clear()
+        with rx_lock:
+            prev_rx = rx_counter["count"]
         t0 = time.monotonic_ns()
-        tx_btp_router.btp_data_request(make_btp_request(encoded_cam))
-        rx_event.wait(timeout=5.0)  # Wait for RX callback (full stack traversal)
+        tx_btp_router.btp_data_request(make_btp_request(coder.encode(cam_value)))
+        # Spin until the RX callback fires (full stack traversal including verify + decode)
+        timeout_ns = t0 + 5 * 10**9
+        while True:
+            with rx_lock:
+                if rx_counter["count"] != prev_rx:
+                    break
+            if time.monotonic_ns() > timeout_ns:
+                break
         t1 = time.monotonic_ns()
         latencies.append((t1 - t0) / 1000)  # μs
 
@@ -609,29 +617,40 @@ def bench_rx(args):
     rx_btp_router = BTPRouter(rx_gn_router)
     rx_gn_router.register_indication_callback(rx_btp_router.btp_data_indication)
 
+    import threading
+    tls = threading.local()
+
     # Direct BTP callback for RX measurement — decode each CAM and record latency
     rx_counter = {"count": 0, "latencies": []}
     rx_lock = threading.Lock()
     coder_rx = CAMCoder()
 
     def rx_btp_callback(indication):
-        t0 = time.monotonic_ns()
+        t1 = time.monotonic_ns()
         try:
             coder_rx.decode(indication.data)
-            t1 = time.monotonic_ns()
+            t2 = time.monotonic_ns()
             with rx_lock:
                 rx_counter["count"] += 1
-                rx_counter["latencies"].append((t1 - t0) / 1000)  # μs
+                if hasattr(tls, "t0"):
+                    rx_counter["latencies"].append((t2 - tls.t0) / 1000)  # μs
+                else:
+                    rx_counter["latencies"].append((t2 - t1) / 1000)  # fallback
         except Exception:
             pass
 
     rx_btp_router.register_indication_callback_btp(2001, rx_btp_callback)
     rx_btp_router.freeze_callbacks()
 
+    original_indicate = rx_gn_router.gn_data_indicate
+    def wrapped_indicate(data, *args, **kwargs):
+        tls.t0 = time.monotonic_ns()
+        original_indicate(data, *args, **kwargs)
+
     rx_link_layer = RawLinkLayer(
         args.interface,
         rx_mac,
-        receive_callback=rx_gn_router.gn_data_indicate,
+        receive_callback=wrapped_indicate,
     )
     rx_gn_router.link_layer = rx_link_layer
 
@@ -850,28 +869,26 @@ def bench_security(args):
 
     if is_sign:
         while time.monotonic_ns() < deadline:
-            req = SNSIGNRequest(
+            t0 = time.monotonic_ns()
+            sign_service.sign_cam(SNSIGNRequest(
                 tbs_message_length=len(tbs_message),
                 tbs_message=tbs_message,
                 its_aid=36,
                 permissions_length=0,
                 permissions=b"",
-            )
-            t0 = time.monotonic_ns()
-            sign_service.sign_cam(req)
+            ))
             t1 = time.monotonic_ns()
             latencies.append((t1 - t0) / 1000)
             count += 1
     else:
         while time.monotonic_ns() < deadline:
-            req = SNVERIFYRequest(
+            t0 = time.monotonic_ns()
+            verify_service.verify(SNVERIFYRequest(
                 sec_header_length=0,
                 sec_header=b"",
                 message_length=len(signed_message),
                 message=signed_message,
-            )
-            t0 = time.monotonic_ns()
-            verify_service.verify(req)
+            ))
             t1 = time.monotonic_ns()
             latencies.append((t1 - t0) / 1000)
             count += 1

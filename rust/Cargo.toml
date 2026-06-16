@@ -1,6 +1,6 @@
 [package]
 name = "flexstack-bench"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Benchmark harness for RustFlexStack"
 
@@ -20,6 +20,7 @@ cv2x = ["rustflexstack/cv2x"]
 rustflexstack = "0.3.0"
 clap = { version = "4", features = ["derive"] }
 rasn = "0.26"
+lazy_static = "1.5.0"
 
 [profile.release]
 opt-level = 3
