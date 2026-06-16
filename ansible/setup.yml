@@ -165,11 +165,14 @@
       tags: [rust]
 
     - name: Download Rust benchmark binary from GitHub release
-      get_url:
-        url: "{{ rust_bin_url }}"
-        dest: "{{ rust_bin }}"
+      command:
+        cmd: curl -L -f -o "{{ rust_bin }}" "{{ rust_bin_url }}"
+      tags: [rust]
+
+    - name: Make Rust benchmark binary executable
+      file:
+        path: "{{ rust_bin }}"
         mode: "0755"
-        force: true
       tags: [rust]
 
     # ── Certificates ───────────────────────────────────────────────────────

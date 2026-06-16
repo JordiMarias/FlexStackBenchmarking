@@ -834,11 +834,18 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let mut warmup_count = 0u64;
     while Instant::now() < warmup_end {
         match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(_) => { warmup_count += 1; }
+            Ok(_) => {
+                warmup_count += 1;
+                let _ = RX_TIMESTAMPS.lock().unwrap().pop_front();
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    
+    // Clear any remaining elements in the queue just to be safe
+    RX_TIMESTAMPS.lock().unwrap().clear();
+
     println!("  Warm-up received {} packets", warmup_count);
 
     // Measurement: collect RX decode latencies
