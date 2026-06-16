@@ -338,7 +338,15 @@ fn spawn_stack(
     let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = GNRouter::spawn(mib, None, None, None);
     let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
 
-    let (ll_to_gn_tx, ll_to_gn_rx) = mpsc::channel::<Vec<u8>>();
+    let (raw_ll_tx, raw_ll_rx) = mpsc::channel::<Vec<u8>>();
+    let (timed_tx, ll_to_gn_rx) = mpsc::channel::<(Instant, Vec<u8>)>();
+    let ll_to_gn_tx = raw_ll_tx.clone();
+
+    thread::spawn(move || {
+        while let Ok(packet) = raw_ll_rx.recv() {
+            let _ = timed_tx.send((Instant::now(), packet));
+        }
+    });
 
     if let Some(svc) = sign_svc {
         // ── TX path: GN → sign → LL ─────────────────────────────────────
@@ -386,8 +394,7 @@ fn spawn_stack(
         let g1 = gn_handle.clone();
         let verify_svc = svc;
         thread::spawn(move || {
-            while let Ok(packet) = ll_to_gn_rx.recv() {
-                let t0 = Instant::now();
+            while let Ok((t0, packet)) = ll_to_gn_rx.recv() {
                 RX_TIMESTAMPS.lock().unwrap().push_back(t0);
                 
                 if packet.len() < 4 {
@@ -436,7 +443,7 @@ fn spawn_stack(
             // Intercept GN→LL to count packets
             let (counted_ll_tx, counted_ll_rx) = mpsc::channel::<Vec<u8>>();
             thread::spawn(move || {
-                while let Ok(packet) = gn_to_ll_rx.recv() {
+                while let Ok(packet) = gn_to_ll_rx.recv() { println!("gn_to_ll_rx len: {}", packet.len());
                     cnt.fetch_add(1, Ordering::Relaxed);
                     let _ = counted_ll_tx.send(packet);
                 }
@@ -447,8 +454,7 @@ fn spawn_stack(
         }
         let g1 = gn_handle.clone();
         thread::spawn(move || {
-            while let Ok(p) = ll_to_gn_rx.recv() {
-                let t0 = Instant::now();
+            while let Ok((t0, p)) = ll_to_gn_rx.recv() {
                 RX_TIMESTAMPS.lock().unwrap().push_back(t0);
                 g1.send_incoming_packet(p);
             }
@@ -843,8 +849,8 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
         }
     }
     
-    // Clear any remaining elements in the queue just to be safe
-    RX_TIMESTAMPS.lock().unwrap().clear();
+    // Do not clear RX_TIMESTAMPS, as there may be in-flight packets in the pipeline
+    // that were dequeued during warmup but haven't reached cam_ind_rx yet.
 
     println!("  Warm-up received {} packets", warmup_count);
 
