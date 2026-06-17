@@ -333,6 +333,7 @@ fn spawn_stack(
     iface: &str,
     sign_svc: Option<Arc<Mutex<SignService>>>,
     tx_wire_counter: Option<Arc<AtomicU64>>,
+    verify_latency_tx: Option<mpsc::Sender<f64>>,
 ) -> (RouterHandle, BTPRouterHandle) {
     // GN router is always spawned WITHOUT security params — security is a middleware
     let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = GNRouter::spawn(mib, None, None, None);
@@ -401,6 +402,7 @@ fn spawn_stack(
                         let request = SNVerifyRequest {
                             message: packet[4..].to_vec(),
                         };
+                        let t0_verify = Instant::now();
                         let (confirm, _events) = {
                             let mut s = verify_svc.lock().unwrap();
                             let s = &mut *s;
@@ -414,6 +416,10 @@ fn spawn_stack(
                             }
                             result
                         };
+                        let t1_verify = Instant::now();
+                        if let Some(ref tx) = verify_latency_tx {
+                            let _ = tx.send(t1_verify.duration_since(t0_verify).as_secs_f64() * 1e6);
+                        }
                         if confirm.report == ReportVerify::Success {
                             let mut new_bh = bh;
                             new_bh.nh = BasicNH::CommonHeader;
@@ -585,7 +591,7 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let wire_counter = Arc::new(AtomicU64::new(0));
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
-    let (gn_handle, btp_handle) = spawn_stack(mib, mac, &args.interface, sign_svc, Some(Arc::clone(&wire_counter)));
+    let (gn_handle, btp_handle) = spawn_stack(mib, mac, &args.interface, sign_svc, Some(Arc::clone(&wire_counter)), None);
 
     // Seed position vector
     let mut epv = LongPositionVector::decode([0u8; 24]);
@@ -674,7 +680,7 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
     } else {
         (None, None)
     };
-    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, Some(Arc::clone(&wire_counter)));
+    let (tx_gn, tx_btp) = spawn_stack(tx_mib, tx_mac, &args.interface, tx_sign_svc, Some(Arc::clone(&wire_counter)), None);
 
     let mut tx_epv = LongPositionVector::decode([0u8; 24]);
     tx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
@@ -690,7 +696,7 @@ fn bench_concurrent(args: &Args) -> BenchmarkResult {
     rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
     rx_mib.itsGnBeaconServiceRetransmitTimer = 0;
 
-    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None);
+    let (rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, rx_sign_svc, None, None);
 
     let mut rx_epv = LongPositionVector::decode([0u8; 24]);
     rx_epv.update_from_gps(41.552, 2.134, 0.0, 0.0, true);
@@ -820,7 +826,8 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let security_on = args.security == "on";
 
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
-    let (_rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, sign_svc, None);
+    let (verify_lat_tx, verify_lat_rx) = mpsc::channel::<f64>();
+    let (_rx_gn, rx_btp) = spawn_stack(rx_mib, rx_mac, &args.interface, sign_svc, None, Some(verify_lat_tx));
 
     // Register RX on BTP port 2001
     let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
@@ -845,6 +852,9 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     
     // Do not clear RX_TIMESTAMPS, as there may be in-flight packets in the pipeline
     // that were dequeued during warmup but haven't reached cam_ind_rx yet.
+
+    // Drain the verification latencies generated during warmup
+    while verify_lat_rx.try_recv().is_ok() {}
 
     println!("  Warm-up received {} packets", warmup_count);
 
@@ -879,6 +889,12 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let total = latencies.len() as u64;
     let throughput = total as f64 / elapsed;
 
+    let mut verify_latencies = Vec::with_capacity(500_000);
+    while let Ok(lat) = verify_lat_rx.try_recv() {
+        verify_latencies.push(lat);
+    }
+    let sign_latency_mean = if verify_latencies.is_empty() { 0.0 } else { mean(&verify_latencies) };
+
     println!("  RX: {} CAMs ({:.0}/s), errors: {}", total, throughput, rx_errors);
 
     let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
@@ -899,7 +915,7 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
         latency_p99: lat_p99,
         latency_min: lat_min,
         latency_max: lat_max,
-        sign_latency_mean: 0.0,
+        sign_latency_mean,
     }
 }
 

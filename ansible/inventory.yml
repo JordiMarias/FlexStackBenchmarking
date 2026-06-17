@@ -21,7 +21,7 @@ all:
     pypy_version: "pypy3.11-v7.3.21"
 
     # ── Rust binary release ─────────────────────────────────────────────────
-    rust_release_tag: "v0.2.5"
+    rust_release_tag: "v0.2.6"
     rust_release_base: "https://github.com/JordiMarias/FlexStackBenchmarking/releases/download/{{ rust_release_tag }}"
 
     # ── Benchmark parameters ────────────────────────────────────────────────

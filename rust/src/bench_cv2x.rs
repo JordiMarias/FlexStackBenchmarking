@@ -31,6 +31,11 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+
+lazy_static::lazy_static! {
+    static ref RX_TIMESTAMPS: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::with_capacity(100_000));
+}
 
 use rustflexstack::btp::router::{BTPRouterHandle, Router as BTPRouter};
 use rustflexstack::btp::service_access_point::{BTPDataIndication, BTPDataRequest};
@@ -334,6 +339,7 @@ fn spawn_stack(
     sign_svc: Option<Arc<Mutex<SignService>>>,
     tx_wire_counter: Option<Arc<AtomicU64>>,
     rx_wire_counter: Option<Arc<AtomicU64>>,
+    verify_latency_tx: Option<mpsc::Sender<f64>>,
 ) -> (RouterHandle, BTPRouterHandle, Arc<AtomicBool>, thread::JoinHandle<()>, thread::JoinHandle<()>) {
     let (gn_handle, gn_to_ll_rx, gn_to_btp_rx) = GNRouter::spawn(mib, None, None, None);
     let (btp_handle, btp_to_gn_rx) = BTPRouter::spawn(mib);
@@ -391,6 +397,9 @@ fn spawn_stack(
         let rx_cnt_sec = rx_wire_counter;
         thread::spawn(move || {
             while let Ok(packet) = ll_to_gn_rx.recv() {
+                let t0 = Instant::now();
+                RX_TIMESTAMPS.lock().unwrap().push_back(t0);
+                
                 if let Some(ref c) = rx_cnt_sec { c.fetch_add(1, Ordering::Relaxed); }
                 if packet.len() < 4 {
                     g1.send_incoming_packet(packet);
@@ -403,6 +412,7 @@ fn spawn_stack(
                         let request = SNVerifyRequest {
                             message: packet[4..].to_vec(),
                         };
+                        let t0_verify = Instant::now();
                         let (confirm, _events) = {
                             let mut s = verify_svc.lock().unwrap();
                             let s = &mut *s;
@@ -416,12 +426,19 @@ fn spawn_stack(
                             }
                             result
                         };
+                        let t1_verify = Instant::now();
+                        if let Some(ref tx) = verify_latency_tx {
+                            let _ = tx.send(t1_verify.duration_since(t0_verify).as_secs_f64() * 1e6);
+                        }
                         if confirm.report == ReportVerify::Success {
                             let mut new_bh = bh;
                             new_bh.nh = BasicNH::CommonHeader;
                             let plain: Vec<u8> = new_bh.encode().iter().copied()
                                 .chain(confirm.plain_message.iter().copied()).collect();
                             g1.send_incoming_packet(plain);
+                        } else {
+                            let mut q = RX_TIMESTAMPS.lock().unwrap();
+                            if !q.is_empty() { q.pop_front(); }
                         }
                     }
                     _ => g1.send_incoming_packet(packet),
@@ -448,6 +465,9 @@ fn spawn_stack(
         let rx_cnt_plain = rx_wire_counter;
         thread::spawn(move || {
             while let Ok(p) = ll_to_gn_rx.recv() {
+                let t0 = Instant::now();
+                RX_TIMESTAMPS.lock().unwrap().push_back(t0);
+                
                 if let Some(ref c) = rx_cnt_plain { c.fetch_add(1, Ordering::Relaxed); }
                 g1.send_incoming_packet(p);
             }
@@ -537,7 +557,7 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
 
     let wire_counter = Arc::new(AtomicU64::new(0));
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
-    let (gn_handle, btp_handle, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(mib, mac, sign_svc, Some(Arc::clone(&wire_counter)), None);
+    let (gn_handle, btp_handle, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(mib, mac, sign_svc, Some(Arc::clone(&wire_counter)), None, None);
 
     // Seed position vector
     let mut epv = LongPositionVector::decode([0u8; 24]);
@@ -636,7 +656,8 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
 
     let sign_svc = if security_on { Some(build_security_stack(args.at as usize, &args.certs_dir)) } else { None };
     let rx_ll_counter = Arc::new(AtomicU64::new(0));
-    let (rx_gn, rx_btp, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(rx_mib, rx_mac, sign_svc, None, Some(Arc::clone(&rx_ll_counter)));
+    let (verify_lat_tx, verify_lat_rx) = mpsc::channel::<f64>();
+    let (rx_gn, rx_btp, stop_flag, ll_rx_join, ll_tx_join) = spawn_stack(rx_mib, rx_mac, sign_svc, None, Some(Arc::clone(&rx_ll_counter)), Some(verify_lat_tx));
 
     // Register RX on BTP port 2001
     let (cam_ind_tx, cam_ind_rx) = mpsc::channel::<BTPDataIndication>();
@@ -650,11 +671,18 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let mut warmup_count = 0u64;
     while Instant::now() < warmup_end {
         match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(_) => { warmup_count += 1; }
+            Ok(_) => { 
+                warmup_count += 1; 
+                let _ = RX_TIMESTAMPS.lock().unwrap().pop_front();
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // Drain verification latencies from warmup
+    while verify_lat_rx.try_recv().is_ok() {}
+
     println!("  Warm-up received {} packets", warmup_count);
 
     // Measurement: collect RX decode latencies
@@ -668,7 +696,7 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     while Instant::now() < bench_end {
         match cam_ind_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ind) => {
-                let t0 = Instant::now();
+                let t0 = RX_TIMESTAMPS.lock().unwrap().pop_front().unwrap_or_else(Instant::now);
                 match coder_rx.decode(&ind.data) {
                     Ok(_) => {
                         let t1 = Instant::now();
@@ -687,6 +715,12 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let elapsed = bench_start.elapsed().as_secs_f64();
     let total = latencies.len() as u64;
     let throughput = total as f64 / elapsed;
+
+    let mut verify_latencies = Vec::with_capacity(500_000);
+    while let Ok(lat) = verify_lat_rx.try_recv() {
+        verify_latencies.push(lat);
+    }
+    let sign_latency_mean = if verify_latencies.is_empty() { 0.0 } else { mean(&verify_latencies) };
 
     let ll_rx_count = rx_ll_counter.load(Ordering::SeqCst);
     println!("  RX radio: {} raw frames from C-V2X radio", ll_rx_count);
@@ -725,7 +759,7 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
         latency_p99: lat_p99,
         latency_min: lat_min,
         latency_max: lat_max,
-        sign_latency_mean: 0.0,
+        sign_latency_mean,
     }
 }
 
