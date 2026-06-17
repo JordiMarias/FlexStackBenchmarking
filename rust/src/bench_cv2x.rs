@@ -546,7 +546,7 @@ fn build_security_stack(at_index: usize, certs_dir: &str) -> Arc<Mutex<SignServi
 }
 
 // ── Benchmark: TX Throughput (C-V2X) ────────────────────────────────────────
-fn bench_tx(args: &Args) -> BenchmarkResult {
+fn bench_tx(args: &Args) -> Vec<BenchmarkResult> {
     let mac = random_mac();
     let mut mib = Mib::new();
     mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(mac));
@@ -627,8 +627,8 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
     let _ = ll_tx_join.join(); // exits once GN router closes the link_layer_tx chain
     eprintln!("shutdown complete");
 
-    BenchmarkResult {
-        run_id: args.run_id,
+    vec![BenchmarkResult {
+        run_id: args.run_id.clone(),
         platform: args.platform.clone(),
         security: args.security.clone(),
         benchmark: "tx".to_string(),
@@ -643,11 +643,11 @@ fn bench_tx(args: &Args) -> BenchmarkResult {
         latency_min: lat_min,
         latency_max: lat_max,
         sign_latency_mean: 0.0,
-    }
+    }]
 }
 
 // ── Benchmark: RX Throughput (C-V2X, receive-only) ──────────────────────────
-fn bench_rx(args: &Args) -> BenchmarkResult {
+fn bench_rx(args: &Args) -> Vec<BenchmarkResult> {
     let rx_mac = random_mac();
     let mut rx_mib = Mib::new();
     rx_mib.itsGnLocalGnAddr = GNAddress::new(M::GnMulticast, ST::PassengerCar, MID::new(rx_mac));
@@ -744,8 +744,8 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
     let _ = ll_tx_join.join(); // exits once GN router closes the link_layer_tx chain
     eprintln!("shutdown complete");
 
-    BenchmarkResult {
-        run_id: args.run_id,
+    let mut results = vec![BenchmarkResult {
+        run_id: args.run_id.clone(),
         platform: args.platform.clone(),
         security: args.security.clone(),
         benchmark: "rx".to_string(),
@@ -759,12 +759,37 @@ fn bench_rx(args: &Args) -> BenchmarkResult {
         latency_p99: lat_p99,
         latency_min: lat_min,
         latency_max: lat_max,
-        sign_latency_mean,
+        sign_latency_mean: 0.0,
+    }];
+
+    if args.security == "on" {
+        let v_total = verify_latencies.len() as u64;
+        let v_throughput = v_total as f64 / elapsed;
+        let (v_mean, v_std, v_p50, v_p95, v_p99, v_min, v_max) = compute_stats(&mut verify_latencies);
+        results.push(BenchmarkResult {
+            run_id: args.run_id.clone(),
+            platform: args.platform.clone(),
+            security: "on".to_string(),
+            benchmark: "security-verify".to_string(),
+            duration_s: elapsed,
+            total_cams: v_total,
+            throughput: v_throughput,
+            latency_mean: v_mean,
+            latency_std: v_std,
+            latency_p50: v_p50,
+            latency_p95: v_p95,
+            latency_p99: v_p99,
+            latency_min: v_min,
+            latency_max: v_max,
+            sign_latency_mean: v_mean,
+        });
     }
+
+    results
 }
 
 // ── Benchmark: Codec ────────────────────────────────────────────────────────
-fn bench_codec(args: &Args) -> BenchmarkResult {
+fn bench_codec(args: &Args) -> Vec<BenchmarkResult> {
     let is_encode = args.mode == "codec-encode";
     let coder = CamCoder::new();
     let station_id = 12345u32;
@@ -810,8 +835,8 @@ fn bench_codec(args: &Args) -> BenchmarkResult {
     let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
         compute_stats(&mut latencies);
 
-    BenchmarkResult {
-        run_id: args.run_id,
+    vec![BenchmarkResult {
+        run_id: args.run_id.clone(),
         platform: args.platform.clone(),
         security: "off".to_string(),
         benchmark: args.mode.clone(),
@@ -826,11 +851,11 @@ fn bench_codec(args: &Args) -> BenchmarkResult {
         latency_min: lat_min,
         latency_max: lat_max,
         sign_latency_mean: 0.0,
-    }
+    }]
 }
 
 // ── Benchmark: Security Layer (Sign / Verify) ──────────────────────────────
-fn bench_security(args: &Args) -> BenchmarkResult {
+fn bench_security(args: &Args) -> Vec<BenchmarkResult> {
     let is_sign = args.mode == "security-sign";
     let coder = CamCoder::new();
     let station_id = 12345u32;
@@ -928,8 +953,8 @@ fn bench_security(args: &Args) -> BenchmarkResult {
     let (lat_mean, lat_std, lat_p50, lat_p95, lat_p99, lat_min, lat_max) =
         compute_stats(&mut latencies);
 
-    BenchmarkResult {
-        run_id: args.run_id,
+    vec![BenchmarkResult {
+        run_id: args.run_id.clone(),
         platform: args.platform.clone(),
         security: "on".to_string(),
         benchmark: args.mode.clone(),
@@ -944,7 +969,7 @@ fn bench_security(args: &Args) -> BenchmarkResult {
         latency_min: lat_min,
         latency_max: lat_max,
         sign_latency_mean: lat_mean,
-    }
+    }]
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -967,7 +992,7 @@ fn main() {
     println!("  Output   : {}", args.output);
     println!();
 
-    let result = match args.mode.as_str() {
+    let results = match args.mode.as_str() {
         "tx" => bench_tx(&args),
         "rx" => bench_rx(&args),
         "codec-encode" | "codec-decode" => bench_codec(&args),
@@ -978,15 +1003,19 @@ fn main() {
         }
     };
 
-    write_csv_row(&args.output, &result);
+    for result in &results {
+        write_csv_row(&args.output, result);
+    }
 
     println!();
     println!("  Results:");
-    println!("    Total        : {}", result.total_cams);
-    println!("    Throughput   : {:.1} CAMs/s", result.throughput);
-    println!("    Latency mean : {:.2} μs", result.latency_mean);
-    println!("    Latency p50  : {:.2} μs", result.latency_p50);
-    println!("    Latency p95  : {:.2} μs", result.latency_p95);
-    println!("    Latency p99  : {:.2} μs", result.latency_p99);
+    if let Some(first) = results.first() {
+        println!("    Total        : {}", first.total_cams);
+        println!("    Throughput   : {:.1} CAMs/s", first.throughput);
+        println!("    Latency mean : {:.2} μs", first.latency_mean);
+        println!("    Latency p50  : {:.2} μs", first.latency_p50);
+        println!("    Latency p95  : {:.2} μs", first.latency_p95);
+        println!("    Latency p99  : {:.2} μs", first.latency_p99);
+    }
     println!("  Written to: {}", args.output);
 }
