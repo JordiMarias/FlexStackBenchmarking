@@ -918,28 +918,6 @@ fn bench_rx(args: &Args) -> Vec<BenchmarkResult> {
         sign_latency_mean: 0.0,
     }];
 
-    if args.security == "on" {
-        let v_total = verify_latencies.len() as u64;
-        let v_throughput = v_total as f64 / elapsed;
-        let (v_mean, v_std, v_p50, v_p95, v_p99, v_min, v_max) = compute_stats(&mut verify_latencies);
-        results.push(BenchmarkResult {
-            run_id: args.run_id.clone(),
-            platform: args.platform.clone(),
-            security: "on".to_string(),
-            benchmark: "security-verify".to_string(),
-            duration_s: elapsed,
-            total_cams: v_total,
-            throughput: v_throughput,
-            latency_mean: v_mean,
-            latency_std: v_std,
-            latency_p50: v_p50,
-            latency_p95: v_p95,
-            latency_p99: v_p99,
-            latency_min: v_min,
-            latency_max: v_max,
-            sign_latency_mean: v_mean,
-        });
-    }
 
     results
 }
